@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GENERAL_QML="${ROOT_DIR}/contents/ui/configGeneral.qml"
 PROVIDERS_QML="${ROOT_DIR}/contents/ui/configProviders.qml"
 ADVANCED_QML="${ROOT_DIR}/contents/ui/configAdvanced.qml"
+README_MD="${ROOT_DIR}/README.md"
 
 require_in_file() {
   local file="$1"
@@ -45,6 +46,13 @@ require_block_fragment "$GENERAL_QML" "id: lastUpdateCheckLabel" "Layout.fillWid
 require_block_fragment "$GENERAL_QML" "id: lastUpdateCheckLabel" "wrapMode: Text.WordWrap"
 require_block_fragment "$GENERAL_QML" "id: lastUpdateStatusLabel" "Layout.fillWidth: true"
 require_block_fragment "$GENERAL_QML" "id: lastUpdateStatusLabel" "wrapMode: Text.WordWrap"
+require_block_fragment "$GENERAL_QML" "id: usePathCommandButton" 'text: i18n("Use PATH")'
+require_block_fragment "$GENERAL_QML" "id: usePathCommandButton" 'enabled: page.cfg_commandPath.trim() !== (page.cfg_commandPathDefault || "codexbar")'
+require_block_fragment "$GENERAL_QML" "id: usePathCommandButton" 'page.cfg_commandPath = page.cfg_commandPathDefault || "codexbar"'
+
+require_in_file "$README_MD" "command -v codexbar"
+reject_in_file "$README_MD" "yay -S codexbar-cli"
+reject_in_file "$README_MD" 'for example `/usr/bin/codexbar`'
 
 require_in_file "$PROVIDERS_QML" "Provider-specific controls come from the CodexBar CLI descriptor"
 reject_in_file "$PROVIDERS_QML" "Provider-specific editing stays in the CodexBar CLI until it exposes a stable settings descriptor"
@@ -848,7 +856,7 @@ if "detailSection.applet.paintRoundedTopBar(" not in provider_detail_section_tex
     raise AssertionError("provider detail bar charts must use rounded top corners")
 for detail_chart_fragment in (
     "detailSection.applet.buildChartBarGradient(",
-    "Math.min(4, Math.floor(width / Math.max(1, points.length * 5)))",
+    "detailSection.applet.chartBarGeometry(width, points.length)",
     "Math.max(2, (height - 3) * fraction)",
 ):
     if detail_chart_fragment not in provider_detail_section_text:
@@ -877,7 +885,7 @@ if "onVisibleChanged: if (visible) requestPaint()" not in cost_sparkline_body:
 for sparkline_fragment in (
     "Layout.preferredHeight: Kirigami.Units.gridUnit * 3.25",
     "root.canvasColor(Kirigami.Theme.textColor, 0.1)",
-    "Math.min(4, Math.floor(width / Math.max(1, points.length * 5)))",
+    "root.chartBarGeometry(width, points.length)",
     "root.buildChartBarGradient(",
     "Math.max(2, (height - 3) * value / maxValue)",
 ):
@@ -1358,6 +1366,37 @@ if "function usageDashboardRows(source, state, depth)" not in main_text:
 reset_time_body = function_body(main_text, "resetLabelLooksLikeTime")
 if r"\S+\s+\d{1,2}:\d{2}" not in reset_time_body:
     raise AssertionError("absolute weekday reset labels must be recognized as times")
+
+# resetText() already emits compact durations such as "2h 30m". Splitting
+# digit-then-letter rewrote those as "2 h 30 m" in the popup, the Overview rows
+# and the resetTime panel mode. Only the letter-then-digit split (which
+# separates a run-together "5h30m" into "5h 30m") may stay.
+reset_label_body = function_body(main_text, "resetLabel")
+if r'.replace(/([A-Za-z])(\d)/g, "$1 $2")' not in reset_label_body:
+    raise AssertionError("resetLabel must split a unit letter that runs into the next number")
+if r'.replace(/(\d)([A-Za-z])/g, "$1 $2")' in reset_label_body:
+    raise AssertionError("resetLabel must not separate a number from its own unit")
+
+# Bar charts are painted for up to 365 cost-history days and 120 detail-chart
+# points. A fixed minimum gap or bar width pushed the last bars past the canvas
+# width, silently hiding the newest data, so both charts share one step-derived
+# geometry helper instead of computing their own bar pitch.
+if "function chartBarGeometry(width, count)" not in main_text:
+    raise AssertionError("main.qml must expose a shared bar-chart geometry helper")
+chart_geometry_body = function_body(main_text, "chartBarGeometry")
+for fragment in ("var step = Math.max(0, Number(width) || 0) / points", "Math.max(1, step - gap)"):
+    if fragment not in chart_geometry_body:
+        raise AssertionError(
+            f"chartBarGeometry must derive gap and bar width from one step: {fragment}"
+        )
+for label, source_text in (
+    ("main.qml", main_text),
+    ("ProviderDetailSection.qml", provider_detail_section_text),
+):
+    if "chartBarGeometry(" not in source_text:
+        raise AssertionError(f"{label} bar charts must use the shared geometry helper")
+    if "barWidth + gap" in source_text:
+        raise AssertionError(f"{label} bar charts must not recompute their own bar pitch")
 
 reset_credits_body = function_body(main_text, "resetCreditsSection")
 if 'i18np("%1 available", "%1 available"' not in reset_credits_body:

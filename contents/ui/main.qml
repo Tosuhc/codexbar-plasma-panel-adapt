@@ -234,14 +234,9 @@ PlasmoidItem {
             "--json-only"
         ]
 
-        var effectiveSource = source
-        if (source.length === 0 && providerKey(providerID) === "codex") {
-            effectiveSource = "cli"
-        }
-
-        if (effectiveSource.length > 0) {
+        if (source.length > 0) {
             parts.push("--source")
-            parts.push(shellQuote(effectiveSource))
+            parts.push(shellQuote(source))
         }
 
         if (includeStatus) {
@@ -283,7 +278,7 @@ PlasmoidItem {
         return ["sh", "-c", shellQuote(script)].join(" ")
     }
 
-    function buildProviderUsageCommand(providerID, codexCliFallback) {
+    function buildProviderUsageCommand(providerID) {
         var parts = [
             shellQuote(commandPath),
             "usage",
@@ -294,14 +289,9 @@ PlasmoidItem {
             "--json-only"
         ]
 
-        var effectiveSource = source
-        if (codexCliFallback && source.length === 0 && providerKey(providerID) === "codex") {
-            effectiveSource = "cli"
-        }
-
-        if (effectiveSource.length > 0) {
+        if (source.length > 0) {
             parts.push("--source")
-            parts.push(shellQuote(effectiveSource))
+            parts.push(shellQuote(source))
         }
 
         var selectedAccount = selectedAccountForProvider(providerID)
@@ -679,7 +669,7 @@ PlasmoidItem {
             if (providerID.length === 0) {
                 continue
             }
-            var baseCommand = buildProviderUsageCommand(providerID, true)
+            var baseCommand = buildProviderUsageCommand(providerID)
             if (seenCommands[baseCommand]) {
                 continue
             }
@@ -1333,6 +1323,22 @@ PlasmoidItem {
         context.lineTo(x + safeWidth, baseline)
         context.closePath()
         context.fill()
+    }
+
+    // Bar charts must fit the canvas for every point count the normalizers
+    // allow (up to 365 cost-history days and 120 detail-chart points). Deriving
+    // both the gap and the bar width from one step keeps the last bar inside
+    // `width`; a fixed minimum gap or bar width would push dense charts off the
+    // right edge and silently hide the newest data.
+    function chartBarGeometry(width, count) {
+        var points = Math.max(1, Math.floor(Number(count) || 0))
+        var step = Math.max(0, Number(width) || 0) / points
+        var gap = Math.max(0, Math.min(4, step / 4))
+        return {
+            step: step,
+            gap: gap,
+            barWidth: Math.max(1, step - gap)
+        }
     }
 
     function buildChartBarGradient(context, accent, baseline, topOpacity, bottomOpacity) {
@@ -3152,10 +3158,11 @@ PlasmoidItem {
         if (!/^[a-z0-9][a-z0-9._-]*$/.test(key) || key.indexOf("..") !== -1) {
             return "view-statistics"
         }
+        // Keyed by the resolved providerKey, so CLI aliases such as
+        // "aws-bedrock" or "kimi-k2" are already normalized before this lookup.
+        // Only providers whose icon asset name differs from their key belong here.
         var aliases = {
-            "aws-bedrock": "bedrock",
-            "gemini": "gemini-white.png",
-            "kimi-k2": "kimik2"
+            "gemini": "gemini-white.png"
         }
         key = ProviderIdentity.providerKey(key, aliases)
         var fileName = key.indexOf(".") === -1 ? key + ".svg" : key
@@ -4081,9 +4088,12 @@ PlasmoidItem {
         if (text.length === 0) {
             return ""
         }
+        // Only split where a unit letter runs into the next number
+        // ("Resets5h30m" -> "Resets 5h 30m"). Splitting digit-then-letter as
+        // well would also tear a number away from its own unit and render our
+        // own compact durations ("2h 30m") as "2 h 30 m".
         text = text
             .replace(/([A-Za-z])(\d)/g, "$1 $2")
-            .replace(/(\d)([A-Za-z])/g, "$1 $2")
             .replace(/\)([A-Za-z])/g, ") $1")
             .replace(/(am|pm)\(/ig, "$1 (")
             .replace(/\s+/g, " ")
@@ -5456,10 +5466,7 @@ PlasmoidItem {
                                         return
                                     }
 
-                                    var gap = Math.max(
-                                        2,
-                                        Math.min(4, Math.floor(width / Math.max(1, points.length * 5))))
-                                    var barWidth = Math.max(2, (width - gap * (points.length - 1)) / points.length)
+                                    var geometry = root.chartBarGeometry(width, points.length)
                                     var baseline = height - 1
 
                                     ctx.fillStyle = root.canvasColor(Kirigami.Theme.textColor, 0.1)
@@ -5472,13 +5479,12 @@ PlasmoidItem {
                                     for (var i = 0; i < points.length; i++) {
                                         var value = Math.max(0, Number(points[i].cost) || 0)
                                         var barHeight = Math.max(2, (height - 3) * value / maxValue)
-                                        var x = i * (barWidth + gap)
                                         ctx.fillStyle = value === maxValue ? peakFill : normalFill
                                         root.paintRoundedTopBar(
                                             ctx,
-                                            x,
+                                            i * geometry.step,
                                             baseline,
-                                            barWidth,
+                                            geometry.barWidth,
                                             barHeight,
                                             Kirigami.Units.smallSpacing / 2)
                                     }
