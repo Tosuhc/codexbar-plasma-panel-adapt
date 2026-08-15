@@ -4222,10 +4222,11 @@ PlasmoidItem {
         return result
     }
 
-    function compactText() {
-        var item = selectedCompactProvider()
+    // Shared by the single-provider compact text and every multi-provider
+    // panel entry so all panel display toggles behave identically.
+    function compactProviderText(item) {
         if (!item) {
-            return loading ? i18n("Loading") : "CodexBar"
+            return ""
         }
 
         var parts = []
@@ -4243,6 +4244,14 @@ PlasmoidItem {
         }
 
         return parts.join(" ")
+    }
+
+    function compactText() {
+        var item = selectedCompactProvider()
+        if (!item) {
+            return loading ? i18n("Loading") : "CodexBar"
+        }
+        return compactProviderText(item)
     }
 
     function panelToolTipText() {

@@ -144,6 +144,7 @@ for qml_file in \
   "$MAIN_QML" \
   "$PROVIDERS_QML" \
   "$ROOT_DIR/contents/ui/components/CompactRepresentation.qml" \
+  "$ROOT_DIR/contents/ui/components/CompactProviderEntry.qml" \
   "$ROOT_DIR/contents/ui/components/OverviewProviderRow.qml" \
   "$ROOT_DIR/contents/ui/components/ProviderConfigRow.qml" \
   "$ROOT_DIR/contents/ui/components/ProviderHeader.qml"; do

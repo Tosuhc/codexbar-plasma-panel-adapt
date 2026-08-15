@@ -1534,12 +1534,12 @@ msgstr[0] ""
 msgstr[1] ""
 
 #: contents/ui/main.qml
-msgid "Loading"
+#, javascript-format
+msgid "%1cr"
 msgstr ""
 
 #: contents/ui/main.qml
-#, javascript-format
-msgid "%1cr"
+msgid "Loading"
 msgstr ""
 
 #: contents/ui/main.qml

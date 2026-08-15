@@ -69,6 +69,7 @@ provider_usage_row_qml = root / "contents/ui/components/ProviderUsageRow.qml"
 overview_provider_row_qml = root / "contents/ui/components/OverviewProviderRow.qml"
 provider_detail_section_qml = root / "contents/ui/components/ProviderDetailSection.qml"
 compact_representation_qml = root / "contents/ui/components/CompactRepresentation.qml"
+compact_provider_entry_qml = root / "contents/ui/components/CompactProviderEntry.qml"
 
 
 def function_body(text, name):
@@ -162,6 +163,7 @@ provider_usage_row_text = provider_usage_row_qml.read_text(encoding="utf-8")
 overview_provider_row_text = overview_provider_row_qml.read_text(encoding="utf-8")
 provider_detail_section_text = provider_detail_section_qml.read_text(encoding="utf-8")
 compact_representation_text = compact_representation_qml.read_text(encoding="utf-8")
+compact_provider_entry_text = compact_provider_entry_qml.read_text(encoding="utf-8")
 
 
 def assert_form_sections(text, filename, labels):
@@ -674,6 +676,7 @@ for source_name, source_text in (
     ("ProviderUsageRow.qml", provider_usage_row_text),
     ("ProviderDetailSection.qml", provider_detail_section_text),
     ("CompactRepresentation.qml", compact_representation_text),
+    ("CompactProviderEntry.qml", compact_provider_entry_text),
     ("OverviewProviderRow.qml", overview_provider_row_text),
 ):
     if "providerReadableColor(" not in source_text:
@@ -684,13 +687,48 @@ if "acceptedButtons: Qt.NoButton" not in compact_status_mouse_body:
     raise AssertionError("the compact incident badge must not consume panel clicks")
 for vertical_fragment in (
     "readonly property bool verticalPanel: applet.verticalFormFactor",
-    "verticalPanel || !hasProviderMeters",
-    "!compactRoot.verticalPanel",
+    "showIdentityIcon: compactRoot.verticalPanel",
+    "showPrimaryEntry: !compactRoot.verticalPanel && !compactRoot.hasProviderEntries",
+    "model: compactRoot.verticalPanel ? [] : compactRoot.multiProviderItems",
 ):
     if vertical_fragment not in compact_representation_text:
         raise AssertionError(
-            "CompactRepresentation must collapse to an icon in vertical panels; "
+            "CompactRepresentation must keep the vertical icon collapse and use "
+            "per-provider text entries in horizontal multi-provider mode; "
             f"missing {vertical_fragment!r}"
+        )
+
+if "function compactProviderText(item)" not in main_text:
+    raise AssertionError("main.qml must share compact text building via compactProviderText")
+if "compactProviderText(" not in compact_provider_entry_text:
+    raise AssertionError("CompactProviderEntry must render text through compactProviderText")
+if "required property var modelData" not in compact_provider_entry_text:
+    raise AssertionError(
+        "CompactProviderEntry must declare modelData so Repeater delegates "
+        "receive provider data at runtime"
+    )
+if "providerData: modelData" in compact_representation_text:
+    raise AssertionError(
+        "multi-provider delegates must not reference modelData from the parent "
+        "file; CompactProviderEntry owns that context property"
+    )
+for multi_provider_fragment in (
+    "Plasmoid.configuration.showMultiProviderInPanel !== true",
+    "result.length < 4",
+    "compactMaximumWidth",
+    "Layout.maximumWidth: compactRoot.verticalPanel",
+):
+    if (multi_provider_fragment not in main_text
+            and multi_provider_fragment not in compact_representation_text):
+        raise AssertionError(
+            "multi-provider panel mode must stay opt-in, capped at four entries, "
+            f"and width-bounded; missing {multi_provider_fragment!r}"
+        )
+for stale_meter_fragment in ("id: compactMeter", "Kirigami.Units.gridUnit * 1.15"):
+    if stale_meter_fragment in compact_representation_text:
+        raise AssertionError(
+            "CompactRepresentation must not restore the thumbnail meter design; "
+            f"found {stale_meter_fragment!r}"
         )
 
 vertical_status_badge_body = id_block(compact_representation_text, "compactVerticalStatusBadge")
@@ -1369,6 +1407,7 @@ popup_and_provider_surfaces = (
     (provider_config_row_qml, provider_config_row_text),
     (provider_usage_row_qml, provider_usage_row_text),
     (provider_detail_section_qml, provider_detail_section_text),
+    (compact_provider_entry_qml, compact_provider_entry_text),
     (overview_provider_row_qml, overview_provider_row_text),
     (compact_representation_qml, compact_representation_text),
 )

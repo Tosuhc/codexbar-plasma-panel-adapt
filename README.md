@@ -100,7 +100,8 @@ provider-defined detail rows and bounded bar/line charts.
 
 Panel and popup:
 
-- Compact panel indicator for one provider or multiple providers.
+- Compact panel indicator: icon and usage text for one provider, or up to four
+  icon + name + usage text entries on horizontal panels with multiple providers.
 - Provider tabs with usage bars, reset windows, account identity, status, and
   credits.
 - Display modes for percent used, pace, percent plus pace, and reset time.

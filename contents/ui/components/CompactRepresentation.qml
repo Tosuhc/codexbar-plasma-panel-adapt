@@ -2,7 +2,6 @@ import QtQuick
 import QtQuick.Controls as Controls
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
-import org.kde.plasma.components as PlasmaComponents
 
 Item {
     id: compactRoot
@@ -10,25 +9,38 @@ Item {
     required property var applet
 
     readonly property bool verticalPanel: applet.verticalFormFactor
-    readonly property bool hasProviderMeters: applet.compactProviders().length > 0
+    readonly property var multiProviderItems: applet.compactProviders()
+    readonly property bool hasProviderEntries: multiProviderItems.length > 0
     readonly property var incidentProvider: applet.primaryIncidentProvider()
-    readonly property string primaryText: applet.compactText()
-    readonly property bool showPrimaryIdentity: verticalPanel || !hasProviderMeters || primaryText.length > 0
+    // Vertical panels collapse to a bare icon. Horizontal multi-provider panels
+    // render one icon + text entry per provider, so the leading identity icon
+    // only reappears there while a refresh is running to keep the spinner.
+    readonly property bool showIdentityIcon: compactRoot.verticalPanel
+        || (compactRoot.applet.loading && compactRoot.hasProviderEntries)
+    readonly property bool showPrimaryEntry: !compactRoot.verticalPanel && !compactRoot.hasProviderEntries
     readonly property int compactExtent: Kirigami.Units.iconSizes.smallMedium
         + Kirigami.Units.smallSpacing * 2
-    readonly property int desiredWidth: verticalPanel
+    readonly property int compactMinimumWidth: Kirigami.Units.gridUnit * 4.8
+    // Safety cap so a four-provider text row cannot push unrelated panel
+    // applets offscreen; entries elide below this width.
+    readonly property int compactMaximumWidth: Kirigami.Units.gridUnit * 40
+    readonly property int desiredWidth: compactRoot.verticalPanel
         ? compactExtent
         : Math.min(
-            Kirigami.Units.gridUnit * 8.5,
-            Math.max(Kirigami.Units.gridUnit * 4.8,
+            compactRoot.compactMaximumWidth,
+            Math.max(compactRoot.compactMinimumWidth,
                 compactRow.implicitWidth + Kirigami.Units.smallSpacing * 2))
 
-    Layout.minimumWidth: desiredWidth
-    Layout.preferredWidth: desiredWidth
-    Layout.maximumWidth: desiredWidth
+    Layout.minimumWidth: compactRoot.verticalPanel
+        ? compactExtent
+        : compactRoot.compactMinimumWidth
+    Layout.preferredWidth: compactRoot.desiredWidth
+    Layout.maximumWidth: compactRoot.verticalPanel
+        ? compactExtent
+        : compactRoot.compactMaximumWidth
     Layout.maximumHeight: Kirigami.Units.iconSizes.smallMedium + Kirigami.Units.smallSpacing * 2
 
-    implicitWidth: desiredWidth
+    implicitWidth: compactRoot.desiredWidth
     implicitHeight: Layout.maximumHeight
     clip: true
 
@@ -50,7 +62,7 @@ Item {
 
             readonly property string compactProvider: compactRoot.applet.selectedCompactProvider() ? compactRoot.applet.selectedCompactProvider().provider : "codex"
 
-            visible: compactRoot.showPrimaryIdentity
+            visible: compactRoot.showIdentityIcon
             source: compactRoot.applet.loading ? "view-refresh" : compactRoot.applet.providerIconSource(compactProvider)
             fallback: "view-statistics"
             isMask: !compactRoot.applet.loading && compactRoot.applet.providerIconIsMask(compactProvider)
@@ -122,68 +134,22 @@ Item {
             }
         }
 
-        PlasmaComponents.Label {
-            visible: !compactRoot.verticalPanel && compactRoot.primaryText.length > 0
-            text: compactRoot.primaryText
-            elide: Text.ElideRight
-            font.bold: true
+        CompactProviderEntry {
+            id: compactPrimaryEntry
+
+            visible: compactRoot.showPrimaryEntry
+            applet: compactRoot.applet
+            modelData: compactRoot.applet.selectedCompactProvider()
+            showSpinner: true
             Layout.fillWidth: true
         }
 
         Repeater {
-            model: compactRoot.verticalPanel ? [] : compactRoot.applet.compactProviders()
+            model: compactRoot.verticalPanel ? [] : compactRoot.multiProviderItems
 
-            delegate: Item {
-                id: compactMeter
-
-                readonly property real meter: compactRoot.applet.switcherPercent(modelData)
-                readonly property color accent: compactRoot.applet.providerReadableColor(
-                    modelData.provider,
-                    Kirigami.Theme.backgroundColor)
-
-                Layout.preferredWidth: Kirigami.Units.gridUnit * 1.15
-                Layout.preferredHeight: compactRow.height
-
-                ColumnLayout {
-                    anchors.centerIn: parent
-                    width: parent.width
-                    spacing: 0
-
-                    Kirigami.Icon {
-                        source: compactRoot.applet.providerIconSource(modelData.provider)
-                        fallback: "view-statistics"
-                        isMask: compactRoot.applet.providerIconIsMask(modelData.provider)
-                        color: compactMeter.accent
-                        Layout.alignment: Qt.AlignHCenter
-                        Layout.preferredWidth: 9
-                        Layout.preferredHeight: 9
-                    }
-
-                    Rectangle {
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: 3
-                        radius: height / 2
-                        color: compactRoot.applet.withAlpha(compactMeter.accent, 0.28)
-                        clip: true
-
-                        Rectangle {
-                            visible: compactMeter.meter >= 0
-                            width: compactMeter.meter <= 0
-                                ? 0
-                                : Math.max(parent.height, parent.width * Math.max(0, Math.min(100, compactMeter.meter)) / 100)
-                            height: parent.height
-                            radius: parent.radius
-                            color: compactMeter.accent
-
-                            Behavior on width {
-                                NumberAnimation {
-                                    duration: Kirigami.Units.longDuration
-                                    easing.type: Easing.OutCubic
-                                }
-                            }
-                        }
-                    }
-                }
+            delegate: CompactProviderEntry {
+                applet: compactRoot.applet
+                Layout.fillWidth: true
             }
         }
     }
