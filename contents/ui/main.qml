@@ -140,6 +140,9 @@ PlasmoidItem {
     readonly property bool overviewAvailable: globalNavigationAvailable && providers.length > 1 && overviewProviderItems.length > 0
     readonly property bool spendAvailable: globalNavigationAvailable && costUsageEnabled
     readonly property bool sessionsAvailable: globalNavigationAvailable
+    // The Sessions tab is intentionally hidden in this fork build; the view and
+    // lifecycle code stays in place so it can be re-enabled without CLI work.
+    readonly property bool showSessionsTab: false
     readonly property int selectedProviderIndex: providerIndexForID(selectedProviderID)
     readonly property bool globalViewSelected: selectionInitialized && selectedProviderID.length === 0
     readonly property bool overviewSelected: overviewAvailable && globalViewSelected && selectedGlobalView === "overview"
@@ -5101,7 +5104,9 @@ PlasmoidItem {
             Item {
                 id: providerTabsBar
 
-                visible: providers.length > 0 || spendAvailable || sessionsAvailable
+                visible: providers.length > 0
+                    || spendAvailable
+                    || (root.showSessionsTab && root.sessionsAvailable)
                 Layout.fillWidth: true
                 Layout.preferredHeight: Kirigami.Units.gridUnit * 2.35
 
@@ -5389,7 +5394,7 @@ PlasmoidItem {
                         }
 
                         Components.GlobalTab {
-                            visible: root.sessionsAvailable
+                            visible: root.showSessionsTab && root.sessionsAvailable
                             applet: root
                             title: i18n("Sessions")
                             tabStrip: providerTabsFlickable
@@ -5401,7 +5406,9 @@ PlasmoidItem {
 
                         Rectangle {
                             visible: providers.length > 0
-                                && (root.overviewAvailable || root.spendAvailable || root.sessionsAvailable)
+                                && (root.overviewAvailable
+                                    || root.spendAvailable
+                                    || (root.showSessionsTab && root.sessionsAvailable))
                             Layout.preferredHeight: providerTabsFlickable.height - Kirigami.Units.smallSpacing * 2
                             Layout.preferredWidth: 1
                             Layout.alignment: Qt.AlignVCenter

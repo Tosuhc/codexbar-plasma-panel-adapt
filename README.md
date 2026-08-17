@@ -110,8 +110,9 @@ Panel and popup:
 - Overview tab with per-provider usage summary and quick switching.
 - Global **Usage & Spend** tab with a Cost/Tokens selector, a 7/30/90-day range
   selector, interactive daily chart, activity heatmap, and provider totals.
-- Local **Sessions** tab backed by `sessions --json-v2`; transcript paths and
-  working directories are never rendered or opened.
+- Local **Sessions** view backed by `sessions --json-v2`; transcript paths and
+  working directories are never rendered or opened. The tab is hidden in this
+  fork build but the view code remains for re-enablement.
 - Overview providers can be limited to a chosen set of up to 3 providers, or
   left automatic (the first 3 eligible providers).
 - Usage dashboard summaries for provider payloads that expose API spend,
