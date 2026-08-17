@@ -7,7 +7,10 @@ import org.kde.plasma.core as PlasmaCore
 import org.kde.plasma.plasma5support as Plasma5Support
 import org.kde.plasma.plasmoid
 import "components" as Components
+import "NotificationMemo.js" as NotificationMemo
+import "PanelElements.js" as PanelElements
 import "ProviderIdentity.js" as ProviderIdentity
+import "QuotaThresholds.js" as QuotaThresholds
 import "SafeText.js" as SafeText
 import "ThemeContrast.js" as ThemeContrast
 import "UsageDetails.js" as UsageDetails
@@ -36,11 +39,23 @@ PlasmoidItem {
     property bool includeStatus: Plasmoid.configuration.includeStatus
     property bool costUsageEnabled: Plasmoid.configuration.costUsageEnabled !== false
     property int costHistoryDays: isFinite(Number(Plasmoid.configuration.costHistoryDays)) ? Math.max(1, Math.min(365, Number(Plasmoid.configuration.costHistoryDays))) : 30
+    // The cost payload already carries per-day tokens next to per-day cost, so
+    // switching the plotted metric never needs a second CLI call.
+    property string costHistoryMetric: safeCostHistoryMetric(Plasmoid.configuration.costHistoryMetric)
+    readonly property bool costHistoryShowsTokens: costHistoryMetric === "tokens"
     property bool usageBarsShowUsed: Plasmoid.configuration.usageBarsShowUsed === true
     property bool showQuotaWarningMarkers: Plasmoid.configuration.showQuotaWarningMarkers !== false
+    readonly property int quotaWarningPercent: QuotaThresholds.warningPercent(
+        Plasmoid.configuration.quotaWarningPercent)
+    // Derived from the warning step so a critical threshold configured below it
+    // can never make the "major" level unreachable.
+    readonly property int quotaCriticalPercent: QuotaThresholds.criticalPercent(
+        quotaWarningPercent,
+        Plasmoid.configuration.quotaCriticalPercent)
     property bool enableNotifications: Plasmoid.configuration.enableNotifications !== false
     property bool notifyStatusIncidents: Plasmoid.configuration.notifyStatusIncidents !== false
     property bool notifyQuotaWarnings: Plasmoid.configuration.notifyQuotaWarnings !== false
+    property bool notifyPredictivePaceWarnings: Plasmoid.configuration.notifyPredictivePaceWarnings === true
     property bool notifyLimitResets: Plasmoid.configuration.notifyLimitResets !== false
     property bool updateChecksEnabled: Plasmoid.configuration.updateChecksEnabled !== false
     property bool updateNotificationsEnabled: Plasmoid.configuration.updateNotificationsEnabled !== false
@@ -48,6 +63,7 @@ PlasmoidItem {
     property int autoUpdateIntervalHours: isFinite(Number(Plasmoid.configuration.autoUpdateIntervalHours)) ? Math.max(1, Math.min(168, Number(Plasmoid.configuration.autoUpdateIntervalHours))) : 24
     property string autoUpdateLastCheck: Plasmoid.configuration.autoUpdateLastCheck || ""
     property string menuBarDisplayMode: safeMenuBarDisplayMode(Plasmoid.configuration.menuBarDisplayMode)
+    property string panelElementOrderRaw: Plasmoid.configuration.panelElementOrder || ""
     property bool resetTimesShowAbsolute: Plasmoid.configuration.resetTimesShowAbsolute === true
     property bool showProviderChangelogs: Plasmoid.configuration.showProviderChangelogs === true
     property bool autoSelectProvider: Plasmoid.configuration.autoSelectProvider === true
@@ -87,9 +103,20 @@ PlasmoidItem {
     property bool providerFallbackActive: false
     property string costCommandSource: buildCostCommand()
     property string connectedCostCommandSource: ""
+    readonly property bool costLoading: connectedCostCommandSource.length > 0
     property var tokenCosts: ({})
     property string costErrorText: ""
+    property string sessionsCommandSource: buildSessionsCommand()
+    property string connectedSessionsCommandSource: ""
+    property var sessions: []
+    property string sessionsErrorText: ""
+    property string sessionsLastUpdatedText: ""
+    property bool sessionsLoading: false
+    property bool sessionsInitialized: false
+    readonly property int maximumSessions: 128
+    readonly property int sessionsCommandTimeoutMs: 60000
     property string selectedProviderID: ""
+    property string selectedGlobalView: "overview"
     property bool selectionInitialized: false
     property var selectedAccounts: ({})
     property var accountOptions: ({})
@@ -109,9 +136,16 @@ PlasmoidItem {
     property string lastNotifiedUpdateVersion: Plasmoid.configuration.lastNotifiedUpdateVersion || ""
     readonly property bool verticalFormFactor: Plasmoid.formFactor === PlasmaCore.Types.Vertical
     readonly property var overviewProviderItems: overviewProviders()
-    readonly property bool overviewAvailable: provider.length === 0 && providers.length > 1 && overviewProviderItems.length > 0
+    readonly property bool globalNavigationAvailable: provider.length === 0
+    readonly property bool overviewAvailable: globalNavigationAvailable && providers.length > 1 && overviewProviderItems.length > 0
+    readonly property bool spendAvailable: globalNavigationAvailable && costUsageEnabled
+    readonly property bool sessionsAvailable: globalNavigationAvailable
     readonly property int selectedProviderIndex: providerIndexForID(selectedProviderID)
-    readonly property bool overviewSelected: overviewAvailable && selectionInitialized && selectedProviderID.length === 0
+    readonly property bool globalViewSelected: selectionInitialized && selectedProviderID.length === 0
+    readonly property bool overviewSelected: overviewAvailable && globalViewSelected && selectedGlobalView === "overview"
+    readonly property bool spendSelected: spendAvailable && globalViewSelected && selectedGlobalView === "spend"
+    readonly property bool sessionsSelected: sessionsAvailable && globalViewSelected && selectedGlobalView === "sessions"
+    readonly property bool providerUsageFeedbackVisible: !spendSelected && !sessionsSelected
     readonly property var selectedProviderData: providers.length > 0 && selectedProviderIndex >= 0
         ? providers[Math.min(selectedProviderIndex, providers.length - 1)]
         : null
@@ -147,6 +181,13 @@ PlasmoidItem {
     onEnableNotificationsChanged: resetNotificationMemo()
     onNotifyStatusIncidentsChanged: resetNotificationMemo()
     onNotifyQuotaWarningsChanged: resetNotificationMemo()
+    onNotifyPredictivePaceWarningsChanged: resetNotificationMemo()
+    // The memo stores the level each row was last observed at. Keeping it across
+    // a threshold change would suppress a warning the new lower threshold should
+    // raise, and leave a row armed at a level the new higher threshold no longer
+    // reaches.
+    onQuotaWarningPercentChanged: resetNotificationMemo()
+    onQuotaCriticalPercentChanged: resetNotificationMemo()
     onNotifyLimitResetsChanged: resetNotificationMemo()
     onUpdateChecksEnabledChanged: {
         if (updateChecksEnabled) {
@@ -164,7 +205,9 @@ PlasmoidItem {
     onProvidersChanged: {
         if (providers.length === 0) {
             selectedProviderID = ""
-            selectionInitialized = false
+            if (!globalNavigationAvailable) {
+                selectionInitialized = false
+            }
             resetNotificationMemo()
             return
         }
@@ -333,16 +376,32 @@ PlasmoidItem {
         return parts.join(" ")
     }
 
+    function buildSessionsCommand() {
+        if (commandPath.length === 0) {
+            return ""
+        }
+        return [shellQuote(commandPath), "sessions", "--json-v2"].join(" ")
+    }
+
     function shellQuote(value) {
         return "'" + String(value).replace(/'/g, "'\\''") + "'"
     }
 
     function safeMenuBarDisplayMode(value) {
         var mode = String(value || "percent")
-        if (mode === "percent" || mode === "pace" || mode === "both" || mode === "resetTime") {
+        if (mode === "percent" || mode === "pace" || mode === "both"
+                || mode === "resetTime" || mode === "runOut") {
             return mode
         }
         return "percent"
+    }
+
+    function safeCostHistoryMetric(value) {
+        return String(value || "cost") === "tokens" ? "tokens" : "cost"
+    }
+
+    function panelElementOrder() {
+        return PanelElements.normalizedOrder(panelElementOrderRaw)
     }
 
     function boundedConfigRevision(value) {
@@ -367,7 +426,7 @@ PlasmoidItem {
     }
 
     function boundedCliMessage(value) {
-        return SafeText.cliMessage(value, SafeText.maximumCliMessageLength)
+        return SafeText.cliMessage(SafeText.stripLoaderDiagnostics(value), SafeText.maximumCliMessageLength)
     }
 
     function isCliRecord(value) {
@@ -422,12 +481,22 @@ PlasmoidItem {
         usageSource.connectSource(sourceName)
     }
 
-    function buildUsageCommandDescriptor(kind, providerID) {
+    function buildUsageCommandDescriptor(kind, providerID, timeoutMs) {
+        var boundedTimeout = Number(timeoutMs)
+        if (!isFinite(boundedTimeout) || boundedTimeout <= 0) {
+            boundedTimeout = usageCommandTimeoutMs
+        }
         return {
             kind: String(kind || ""),
             providerID: String(providerID || ""),
-            deadlineMs: Date.now() + usageCommandTimeoutMs
+            deadlineMs: Date.now() + boundedTimeout
         }
+    }
+
+    function buildCostCommandDescriptor() {
+        var descriptor = buildUsageCommandDescriptor("cost", "")
+        descriptor.costHistoryDays = costHistoryDays
+        return descriptor
     }
 
     function finishUsageCommandSource(sourceName) {
@@ -446,6 +515,9 @@ PlasmoidItem {
         retireUsageCommands()
         retireStaleAccountCommands()
         refreshCost()
+        if (sessionsInitialized) {
+            refreshSessions()
+        }
         providerFallbackActive = false
 
         if (commandSource.length === 0) {
@@ -474,6 +546,11 @@ PlasmoidItem {
         if (connectedProviderConfigCommandSource.length > 0) {
             finishUsageCommandSource(connectedProviderConfigCommandSource)
             connectedProviderConfigCommandSource = ""
+        }
+        if (connectedSessionsCommandSource.length > 0) {
+            finishUsageCommandSource(connectedSessionsCommandSource)
+            connectedSessionsCommandSource = ""
+            sessionsLoading = false
         }
         for (var command in pendingProviderCommands) {
             finishUsageCommandSource(command)
@@ -522,7 +599,28 @@ PlasmoidItem {
         connectedCostCommandSource = commandWithRunNonce(costCommandSource)
         connectUsageCommand(
             connectedCostCommandSource,
-            buildUsageCommandDescriptor("cost", ""))
+            buildCostCommandDescriptor())
+    }
+
+    function refreshSessions() {
+        if (connectedSessionsCommandSource.length > 0) {
+            finishUsageCommandSource(connectedSessionsCommandSource)
+            connectedSessionsCommandSource = ""
+        }
+
+        sessionsInitialized = true
+        if (sessionsCommandSource.length === 0) {
+            sessionsLoading = false
+            sessionsErrorText = i18n("Set the codexbar command path in widget settings.")
+            return
+        }
+
+        sessionsLoading = true
+        sessionsErrorText = ""
+        connectedSessionsCommandSource = commandWithRunNonce(sessionsCommandSource)
+        connectUsageCommand(
+            connectedSessionsCommandSource,
+            buildUsageCommandDescriptor("sessions", "", sessionsCommandTimeoutMs))
     }
 
     function parseOutput(stdoutText, stderrText) {
@@ -928,6 +1026,14 @@ PlasmoidItem {
             return
         }
 
+        if (descriptor.kind === "sessions" && sourceName === connectedSessionsCommandSource) {
+            connectedSessionsCommandSource = ""
+            finishUsageCommandSource(sourceName)
+            sessionsLoading = false
+            sessionsErrorText = i18n("Loading sessions timed out. Try again.")
+            return
+        }
+
         if (descriptor.kind === "providerConfig"
                 && sourceName === connectedProviderConfigCommandSource) {
             connectedProviderConfigCommandSource = ""
@@ -1079,7 +1185,7 @@ PlasmoidItem {
         return result
     }
 
-    function parseCostOutput(stdoutText, stderrText) {
+    function parseCostOutput(stdoutText, stderrText, requestedHistoryDays) {
         var trimmed = stdoutText.trim()
         if (trimmed.length === 0) {
             costErrorText = stderrText.trim().length > 0 ? boundedCliMessage(stderrText) : i18n("codexbar cost did not return JSON.")
@@ -1108,7 +1214,7 @@ PlasmoidItem {
             if (costMessage.length === 0 && item && item.error && item.error.message) {
                 costMessage = boundedCliMessage(item.error.message)
             }
-            var cost = normalizeTokenCost(item)
+            var cost = normalizeTokenCost(item, requestedHistoryDays)
             var providerID = cost ? providerMapKey(cost.provider) : ""
             if (cost && providerID.length > 0) {
                 nextCosts[providerID] = cost
@@ -1131,7 +1237,135 @@ PlasmoidItem {
         applyTokenCosts()
     }
 
-    function normalizeTokenCost(item) {
+    function parseSessionsOutput(stdoutText, stderrText) {
+        sessionsLoading = false
+        var trimmed = stdoutText.trim()
+        if (trimmed.length === 0) {
+            sessionsErrorText = stderrText.trim().length > 0
+                ? boundedCliMessage(stderrText)
+                : i18n("codexbar sessions did not return JSON.")
+            return
+        }
+
+        var payload
+        try {
+            payload = JSON.parse(trimmed)
+        } catch (error) {
+            sessionsErrorText = i18n("Could not parse codexbar sessions JSON: %1", error.message)
+            return
+        }
+
+        var items
+        if (Array.isArray(payload)) {
+            items = payload
+        } else if (isCliRecord(payload) && Array.isArray(payload.sessions)) {
+            items = payload.sessions
+        } else {
+            sessionsErrorText = i18n("codexbar sessions returned an unsupported JSON payload.")
+            return
+        }
+        var nextSessions = []
+        var itemLimit = Math.min(items.length, maximumSessions)
+        for (var i = 0; i < itemLimit; i++) {
+            var normalized = normalizeSession(items[i])
+            if (normalized) {
+                nextSessions.push(normalized)
+            }
+        }
+        nextSessions.sort(function(a, b) { return b.activityMs - a.activityMs })
+        sessions = nextSessions
+        sessionsErrorText = ""
+        sessionsLastUpdatedText = i18n("Updated %1", Qt.formatDateTime(new Date(), "hh:mm"))
+    }
+
+    function normalizeSession(item) {
+        if (!isCliRecord(item)) {
+            return null
+        }
+
+        var providerID = normalizedProviderID(item.provider)
+        var projectName = boundedDisplayText(item.projectName, 160)
+        var sessionName = boundedDisplayText(item.sessionName, 240)
+        var host = boundedDisplayText(item.host, 160)
+        var state = boundedDisplayText(item.state, 40).toLowerCase()
+        var sourceName = boundedDisplayText(item.source, 80)
+        var activityAt = boundedDisplayText(item.lastActivityAt, 128)
+        var activityMs = Date.parse(activityAt)
+        if (!isFinite(activityMs)) {
+            activityAt = boundedDisplayText(item.startedAt, 128)
+            activityMs = Date.parse(activityAt)
+        }
+        if (!isFinite(activityMs)) {
+            activityAt = ""
+            activityMs = 0
+        }
+        if (providerID.length === 0 && projectName.length === 0 && sessionName.length === 0) {
+            return null
+        }
+
+        return {
+            provider: providerID,
+            projectName: projectName,
+            sessionName: sessionName,
+            host: host,
+            state: state,
+            source: sourceName,
+            activityAt: activityAt,
+            activityMs: activityMs
+        }
+    }
+
+    function sessionTitle(item) {
+        if (!item) {
+            return i18n("Untitled session")
+        }
+        return item.projectName.length > 0
+            ? item.projectName
+            : (item.sessionName.length > 0 ? item.sessionName : i18n("Untitled session"))
+    }
+
+    function sessionSubtitle(item) {
+        if (!item) {
+            return ""
+        }
+        var details = []
+        if (item.provider.length > 0) {
+            details.push(providerTitle(item.provider))
+        }
+        if (item.host.length > 0) {
+            details.push(item.host)
+        }
+        if (item.source.length > 0) {
+            details.push(item.source)
+        }
+        return details.join(" - ")
+    }
+
+    function sessionActivityText(item, nowMs) {
+        if (!item || !isFinite(Number(item.activityMs)) || Number(item.activityMs) <= 0) {
+            return ""
+        }
+        var currentTimeMs = Number(nowMs)
+        if (!isFinite(currentTimeMs) || currentTimeMs <= 0) {
+            currentTimeMs = Date.now()
+        }
+        var elapsedSeconds = Math.max(0, Math.floor((currentTimeMs - Number(item.activityMs)) / 1000))
+        if (elapsedSeconds < 60) {
+            return i18n("Just now")
+        }
+        var minutes = Math.floor(elapsedSeconds / 60)
+        if (minutes < 60) {
+            return i18np("%1 minute ago", "%1 minutes ago", minutes)
+        }
+        var hours = Math.floor(minutes / 60)
+        if (hours < 24) {
+            return i18np("%1 hour ago", "%1 hours ago", hours)
+        }
+        var days = Math.floor(hours / 24)
+        return i18np("%1 day ago", "%1 days ago", days)
+    }
+
+    function normalizeTokenCost(item, requestedHistoryDays) {
         if (!item || !item.provider) {
             return null
         }
@@ -1141,23 +1375,37 @@ PlasmoidItem {
             return null
         }
         var currency = boundedDisplayText(item.currencyCode || "USD", 12)
-        var windowLabel = boundedDisplayText(item.historyLabel || costHistoryWindowLabel(item), 120)
+        var emittedHistoryDays = Number(item.historyDays)
+        var fallbackHistoryDays = Number(requestedHistoryDays)
+        var historyDays = isFinite(emittedHistoryDays) && emittedHistoryDays > 0
+            ? Math.max(1, Math.min(maximumCostHistoryPoints, Math.floor(emittedHistoryDays)))
+            : (isFinite(fallbackHistoryDays) && fallbackHistoryDays > 0
+            ? Math.max(1, Math.min(maximumCostHistoryPoints, Math.floor(fallbackHistoryDays)))
+            : 30)
+        var windowLabel = boundedDisplayText(item.historyLabel || costHistoryWindowLabel(item, historyDays), 120)
         return {
             provider: providerID,
+            historyDays: historyDays,
+            // Older payloads omit the flag; absent means "do not warn".
+            historyCoverageEstablished: item.historyCoverageIsEstablished !== false,
             title: i18n("Cost"),
             sessionLine: costLine(i18n("Today"), item.sessionCostUSD, item.sessionTokens, currency),
             monthLine: costLine(windowLabel, item.last30DaysCostUSD, item.last30DaysTokens, currency),
+            windowValueLine: costValueLine(item.last30DaysCostUSD, item.last30DaysTokens, currency),
             hintLine: tokenCostHint(providerID),
             totals: normalizeCostTotals(item.totals, item.last30DaysCostUSD, item.last30DaysTokens, currency),
-            models: normalizeCostModels(item.daily, currency, costHistoryDays),
-            daily: normalizeCostDaily(item.daily, currency, costHistoryDays)
+            models: normalizeCostModels(item.daily, currency, historyDays),
+            daily: normalizeCostDaily(item.daily, currency, historyDays)
         }
     }
 
-    function costHistoryWindowLabel(item) {
+    function costHistoryWindowLabel(item, requestedHistoryDays) {
         var rawDays = item && item.historyDays !== undefined && item.historyDays !== null
             ? Number(item.historyDays)
-            : Number(costHistoryDays)
+            : NaN
+        if (!isFinite(rawDays) || rawDays <= 0) {
+            rawDays = Number(requestedHistoryDays)
+        }
         if (!isFinite(rawDays) || rawDays <= 0) {
             return i18n("Last 30 days")
         }
@@ -1297,15 +1545,18 @@ PlasmoidItem {
         return rows.slice(0, 6)
     }
 
+    // Returns the peak of the currently plotted metric, so the bars keep their
+    // scale when the Usage & Spend tab switches between cost and tokens.
     function costSparklineMax(points) {
-        var maxCost = 0
+        var maximum = 0
         if (!points) {
-            return maxCost
+            return maximum
         }
         for (var i = 0; i < points.length; i++) {
-            maxCost = Math.max(maxCost, Number(points[i].cost) || 0)
+            maximum = Math.max(maximum, Number(
+                costHistoryShowsTokens ? points[i].tokens : points[i].cost) || 0)
         }
-        return maxCost
+        return maximum
     }
 
     function paintRoundedTopBar(context, x, baseline, width, height, radius) {
@@ -1354,7 +1605,156 @@ PlasmoidItem {
         }
         var last = points[points.length - 1]
         var label = last.label && last.label.length > 0 ? last.label : i18n("Latest")
-        return i18n("%1: %2", label, amountString(last.cost, last.currency || "USD"))
+        var value = costHistoryShowsTokens
+            ? tokenCountString(last.tokens)
+            : amountString(last.cost, last.currency || "USD")
+        return i18n("%1: %2", label, value)
+    }
+
+    function costChartPoints(points) {
+        var result = []
+        if (!points) {
+            return result
+        }
+        for (var i = 0; i < points.length; i++) {
+            var point = points[i]
+            var value = Math.max(0, Number(
+                costHistoryShowsTokens ? point.tokens : point.cost) || 0)
+            result.push({
+                label: boundedDisplayText(point.label, 120),
+                value: value,
+                displayValue: costHistoryShowsTokens
+                    ? tokenCountString(value)
+                    : amountString(value, point.currency || "USD")
+            })
+        }
+        return result
+    }
+
+    function spendProviderCosts() {
+        var result = []
+        for (var providerID in tokenCosts) {
+            if (!hasOwnKey(tokenCosts, providerID)) {
+                continue
+            }
+            var tokenCost = tokenCosts[providerID]
+            if (!costSnapshotMatchesSelectedRange(tokenCost)) {
+                continue
+            }
+            result.push(tokenCost)
+        }
+        result.sort(function(a, b) {
+            return providerTitle(a.provider).localeCompare(providerTitle(b.provider))
+        })
+        return result
+    }
+
+    function costSnapshotMatchesSelectedRange(tokenCost) {
+        if (!tokenCost) {
+            return false
+        }
+        var snapshotDays = Number(tokenCost.historyDays)
+        return isFinite(snapshotDays)
+            && Math.floor(snapshotDays) === Math.floor(Number(costHistoryDays))
+    }
+
+    function spendDailyPoints() {
+        var costs = spendProviderCosts()
+        var byDate = ({})
+        var currency = spendCurrency(costs)
+        for (var i = 0; i < costs.length; i++) {
+            var daily = costs[i].daily || []
+            for (var j = 0; j < daily.length; j++) {
+                var point = daily[j]
+                var label = boundedDisplayText(point.label, 120)
+                var pointCurrency = boundedDisplayText(point.currency || "USD", 12)
+                // Mixed currencies cannot be summed as money, but token counts
+                // are currency-free: filtering them would silently drop whole
+                // providers from the chart.
+                if (label.length === 0
+                        || isUnsafeObjectKey(label)
+                        || (!costHistoryShowsTokens && pointCurrency !== currency)) {
+                    continue
+                }
+                if (!hasOwnKey(byDate, label)) {
+                    byDate[label] = { label: label, value: 0, currency: currency }
+                }
+                byDate[label].value += Math.max(0, Number(
+                    costHistoryShowsTokens ? point.tokens : point.cost) || 0)
+            }
+        }
+
+        var result = []
+        for (var day in byDate) {
+            if (!hasOwnKey(byDate, day)) {
+                continue
+            }
+            var item = byDate[day]
+            item.displayValue = costHistoryShowsTokens
+                ? tokenCountString(item.value)
+                : amountString(item.value, item.currency)
+            result.push(item)
+        }
+        result.sort(function(a, b) { return a.label.localeCompare(b.label) })
+        return result.slice(Math.max(0, result.length - maximumCostHistoryPoints))
+    }
+
+    function spendCurrency(costs) {
+        var items = costs || spendProviderCosts()
+        for (var i = 0; i < items.length; i++) {
+            var totals = items[i].totals || ({})
+            var currency = boundedDisplayText(totals.currency || "", 12)
+            if (currency.length > 0) {
+                return currency
+            }
+            var daily = items[i].daily || []
+            if (daily.length > 0) {
+                return boundedDisplayText(daily[0].currency || "USD", 12)
+            }
+        }
+        return "USD"
+    }
+
+    function spendTotalLine() {
+        var costs = spendProviderCosts()
+        var totalCost = 0
+        var totalTokens = 0
+        var currency = spendCurrency(costs)
+        for (var i = 0; i < costs.length; i++) {
+            var totals = costs[i].totals || ({})
+            var itemCurrency = boundedDisplayText(totals.currency || currency, 12)
+            if (itemCurrency !== currency) {
+                continue
+            }
+            totalCost += Math.max(0, Number(totals.cost) || 0)
+            totalTokens += Math.max(0, Number(totals.tokens) || 0)
+        }
+        if (costs.length === 0) {
+            return ""
+        }
+        return i18n("%1 total - %2 tokens", amountString(totalCost, currency), tokenCountString(totalTokens))
+    }
+
+    function setCostHistoryDays(days) {
+        var nextDays = Math.max(1, Math.min(maximumCostHistoryPoints, Math.floor(Number(days) || 30)))
+        Plasmoid.configuration.costHistoryDays = nextDays
+    }
+
+    function setCostHistoryMetric(metric) {
+        Plasmoid.configuration.costHistoryMetric = safeCostHistoryMetric(metric)
+    }
+
+    // The CLI reports whether its local log scan already covers the requested
+    // window; until it does, the earliest bars are short for a scan reason
+    // rather than a spend reason.
+    function spendHistoryStillBuilding() {
+        var costs = spendProviderCosts()
+        for (var i = 0; i < costs.length; i++) {
+            if (costs[i].historyCoverageEstablished === false) {
+                return true
+            }
+        }
+        return false
     }
 
     function costBreakdownRows(tokenCost) {
@@ -1407,16 +1807,17 @@ PlasmoidItem {
         var first = Math.max(0, tokenCost.daily.length - 7)
         var visibleDaily = tokenCost.daily.slice(first)
         var rows = []
-        var maxCost = costSparklineMax(visibleDaily)
+        var maximum = costSparklineMax(visibleDaily)
         for (var i = visibleDaily.length - 1; i >= 0; i--) {
             var item = visibleDaily[i]
-            var cost = Math.max(0, Number(item.cost) || 0)
-            var value = compactCostTokenSummary(cost, item.tokens, item.currency)
+            var magnitude = Math.max(0, Number(
+                costHistoryShowsTokens ? item.tokens : item.cost) || 0)
+            var value = compactCostTokenSummary(item.cost, item.tokens, item.currency)
             rows.push({
                 label: item.label && item.label.length > 0 ? item.label : i18n("Latest"),
                 value: value.length > 0 ? value : amountString(0, item.currency || "USD"),
-                percent: maxCost > 0 ? Math.max(3, cost * 100 / maxCost) : 0,
-                isPeak: maxCost > 0 && cost === maxCost
+                percent: maximum > 0 ? Math.max(3, magnitude * 100 / maximum) : 0,
+                isPeak: maximum > 0 && magnitude === maximum
             })
         }
         return rows
@@ -1427,21 +1828,26 @@ PlasmoidItem {
             return ""
         }
 
+        // The bars highlight the peak of the selected metric, so this label has
+        // to name the same day, not the most expensive one.
         var peak = null
         for (var i = 0; i < points.length; i++) {
-            var cost = Number(points[i].cost) || 0
-            if (!peak || cost > peak.cost) {
+            var magnitude = Number(
+                costHistoryShowsTokens ? points[i].tokens : points[i].cost) || 0
+            if (!peak || magnitude > peak.magnitude) {
                 peak = {
                     label: points[i].label && points[i].label.length > 0 ? points[i].label : i18n("Latest"),
-                    cost: cost,
+                    magnitude: magnitude,
                     currency: points[i].currency || "USD"
                 }
             }
         }
-        if (!peak || peak.cost <= 0) {
+        if (!peak || peak.magnitude <= 0) {
             return ""
         }
-        return i18n("Peak: %1 - %2", peak.label, amountString(peak.cost, peak.currency))
+        return i18n("Peak: %1 - %2", peak.label, costHistoryShowsTokens
+            ? tokenCountString(peak.magnitude)
+            : amountString(peak.magnitude, peak.currency))
     }
 
     function costAverageDailyLine(points) {
@@ -1452,7 +1858,8 @@ PlasmoidItem {
         var total = 0
         var currency = "USD"
         for (var i = 0; i < points.length; i++) {
-            total += Math.max(0, Number(points[i].cost) || 0)
+            total += Math.max(0, Number(
+                costHistoryShowsTokens ? points[i].tokens : points[i].cost) || 0)
             if (points[i].currency) {
                 currency = points[i].currency
             }
@@ -1460,7 +1867,10 @@ PlasmoidItem {
         if (total <= 0) {
             return ""
         }
-        return i18n("Average/day: %1", amountString(total / points.length, currency))
+        var average = total / points.length
+        return i18n("Average/day: %1", costHistoryShowsTokens
+            ? tokenCountString(average)
+            : amountString(average, currency))
     }
 
     function costPerMillionLine(tokenCost) {
@@ -2022,6 +2432,9 @@ PlasmoidItem {
             leftPercent: hasPercent ? clamp(100 - used, 0, 100) : 0,
             pacePercent: paceValue,
             paceOnTop: !pace || pace.willLastToReset !== false,
+            paceEtaSeconds: pace && isFinite(Number(pace.etaSeconds))
+                ? Math.max(0, Math.min(31536000, Number(pace.etaSeconds)))
+                : 0,
             resetsAt: boundedDisplayText(
                 window.resetsAt === undefined || window.resetsAt === null ? "" : window.resetsAt,
                 128),
@@ -2396,16 +2809,37 @@ PlasmoidItem {
         if (!showQuotaWarningMarkers || !row || !row.hasPercent) {
             return []
         }
-        var warning = usageBarsShowUsed ? 80 : 20
-        var critical = usageBarsShowUsed ? 95 : 5
-        return [
-            { percent: warning, severity: "minor" },
-            { percent: critical, severity: "major" }
-        ]
+        return QuotaThresholds.markers(
+            quotaWarningPercent,
+            quotaCriticalPercent,
+            usageBarsShowUsed)
     }
 
+    // The thresholds used to surface only as two ticks on the provider detail
+    // meter, so an almost exhausted window looked exactly like an idle one on
+    // the panel and in the overview. Every meter fill reads its colour from
+    // this one level; the provider accent stays in charge below the warning
+    // step, and the same setting that hides the markers hides the colour.
+    function quotaSeverity(row) {
+        if (!showQuotaWarningMarkers || !row || !row.hasPercent) {
+            return ""
+        }
+        return QuotaThresholds.level(row.usedPercent, quotaWarningPercent, quotaCriticalPercent)
+    }
+
+    function quotaMeterColor(row, accent) {
+        var severity = quotaSeverity(row)
+        return severity.length > 0 ? statusBadgeColor(severity) : accent
+    }
+
+    // Quota, pace, and reset memo state is threshold-derived and has to be
+    // rebuilt whenever a setting changes. Provider status is not: a settings
+    // change is not a status transition, so the status baseline survives the
+    // reset. Dropping it would either re-announce an ongoing incident or, once
+    // the first observation is silently primed, swallow an incident that starts
+    // while the provider is still refreshing.
     function resetNotificationMemo() {
-        notificationMemo = ({})
+        notificationMemo = NotificationMemo.preservedMemoAfterReset(notificationMemo)
         notificationsPrimed = false
         Qt.callLater(processNotifications)
     }
@@ -2459,8 +2893,8 @@ PlasmoidItem {
         return JSON.stringify([providerID, currentAccount])
     }
 
-    function statusNotificationKey(item) {
-        return "status:" + providerMapKey(item.provider)
+    function carryStatusNotificationMemo(item, nextMemo) {
+        NotificationMemo.carryStatusMemo(notificationMemo, providerMapKey(item.provider), nextMemo)
     }
 
     function notificationScopePrimedKey(item) {
@@ -2471,8 +2905,11 @@ PlasmoidItem {
         var scope = notificationScopeKey(item)
         var quotaPrefix = "quota:" + scope + ":"
         var resetPrefix = "reset:" + scope + ":"
+        var pacePrefix = "pace:" + scope + ":"
         for (var key in nextMemo) {
-            if (key.indexOf(quotaPrefix) === 0 || key.indexOf(resetPrefix) === 0) {
+            if (key.indexOf(quotaPrefix) === 0
+                    || key.indexOf(resetPrefix) === 0
+                    || key.indexOf(pacePrefix) === 0) {
                 delete nextMemo[key]
             }
         }
@@ -2501,20 +2938,36 @@ PlasmoidItem {
                 }
             }
         }
+        if (notifyPredictivePaceWarnings) {
+            var paceRows = item.rows || []
+            for (var m = 0; m < paceRows.length; m++) {
+                if (paceWarningActive(paceRows[m])) {
+                    nextMemo[paceNotificationKey(item, paceRows[m], m)] = "1"
+                }
+            }
+        }
     }
 
     function primeNotifications() {
         var nextMemo = ({})
         for (var i = 0; i < providers.length; i++) {
             var item = providers[i]
-            if (!item || notificationProviderRefreshPending(item.provider)) {
+            if (!item) {
+                continue
+            }
+            if (notificationProviderRefreshPending(item.provider)) {
+                // The cached snapshot cannot become a baseline, but an existing
+                // baseline must not be lost either: without it a status change
+                // during the pending interval would prime silently instead of
+                // notifying.
+                carryStatusNotificationMemo(item, nextMemo)
                 continue
             }
             if (notifyStatusIncidents) {
-                var statusValue = notificationStatusValue(item)
-                if (statusValue.length > 0) {
-                    nextMemo[statusNotificationKey(item)] = statusValue
-                }
+                NotificationMemo.applyStatusDecision(
+                    nextMemo,
+                    providerMapKey(item.provider),
+                    ({ notify: false, value: notificationStatusValue(item) }))
             }
             primeAccountNotificationScope(item, nextMemo)
         }
@@ -2552,6 +3005,9 @@ PlasmoidItem {
             if (notifyQuotaWarnings) {
                 processQuotaNotifications(item, nextMemo)
             }
+            if (notifyPredictivePaceWarnings) {
+                processPaceNotifications(item, nextMemo)
+            }
             if (notifyLimitResets) {
                 processLimitResetNotifications(item, nextMemo)
             }
@@ -2559,30 +3015,21 @@ PlasmoidItem {
         notificationMemo = nextMemo
     }
 
+    // The notify/stay-quiet decision lives in NotificationMemo.statusDecision so
+    // it can be tested directly; this keeps only the side effect.
     function processStatusNotification(item, nextMemo) {
-        var key = statusNotificationKey(item)
-        var value = notificationStatusValue(item)
-        var previousValue = String(notificationMemo[key] || "")
-        if (value.length > 0) {
-            var previousSeverity = previousValue.length > 0 ? previousValue.split("|")[0] : ""
-            var worsened = notificationRank(item.statusSeverity) > notificationRank(previousSeverity)
-            // Notify for a new incident, worsened severity, or a changed
-            // same-severity stable incident key so replacements are not missed
-            // without treating provider-controlled status text as notification identity.
-            var previousIncidentKey = notificationStatusIncidentKey(previousValue)
-            var currentIncidentKey = notificationStatusIncidentKey(value)
-            var incidentChanged = previousIncidentKey.length > 0
-                && currentIncidentKey.length > 0
-                && previousIncidentKey !== currentIncidentKey
-            if (previousValue.length === 0 || worsened || incidentChanged) {
-                sendPlasmaNotification(
-                    i18n("%1 status issue", item.title),
-                    item.status,
-                    notificationUrgency(item.statusSeverity))
-            }
-            nextMemo[key] = value
-        } else {
-            delete nextMemo[key]
+        var providerID = providerMapKey(item.provider)
+        var decision = NotificationMemo.statusDecision(
+            notificationMemo,
+            providerID,
+            notificationStatusValue(item),
+            item.statusSeverity)
+        NotificationMemo.applyStatusDecision(nextMemo, providerID, decision)
+        if (decision.notify) {
+            sendPlasmaNotification(
+                i18n("%1 status issue", item.title),
+                item.status,
+                notificationUrgency(item.statusSeverity))
         }
     }
 
@@ -2606,6 +3053,48 @@ PlasmoidItem {
             }
             if (level.length > 0) {
                 nextMemo[key] = level
+            } else {
+                delete nextMemo[key]
+            }
+        }
+    }
+
+    function paceWarningActive(row) {
+        return row && row.paceOnTop === false && Number(row.paceEtaSeconds) > 0
+    }
+
+    function paceNotificationKey(item, row, index) {
+        var lane = row && row.lane ? row.lane : ""
+        var reset = row && row.resetsAt ? row.resetsAt : ""
+        return "pace:" + notificationScopeKey(item) + ":" + lane + ":" + reset + ":" + index
+    }
+
+    function paceEtaText(seconds) {
+        var minutes = Math.max(1, Math.round(Number(seconds) / 60))
+        if (minutes < 60) {
+            return i18np("%1 minute", "%1 minutes", minutes)
+        }
+        var hours = Math.max(1, Math.round(minutes / 60))
+        if (hours < 48) {
+            return i18np("%1 hour", "%1 hours", hours)
+        }
+        var days = Math.max(1, Math.round(hours / 24))
+        return i18np("%1 day", "%1 days", days)
+    }
+
+    function processPaceNotifications(item, nextMemo) {
+        var rows = item.rows || []
+        for (var i = 0; i < rows.length; i++) {
+            var row = rows[i]
+            var key = paceNotificationKey(item, row, i)
+            if (paceWarningActive(row)) {
+                if (notificationMemo[key] !== "1") {
+                    sendPlasmaNotification(
+                        i18n("%1 pace warning", item.title),
+                        i18n("%1 may run out in %2", row.label, paceEtaText(row.paceEtaSeconds)),
+                        "normal")
+                }
+                nextMemo[key] = "1"
             } else {
                 delete nextMemo[key]
             }
@@ -2654,13 +3143,7 @@ PlasmoidItem {
             return ""
         }
         var incidentKey = item.statusIncidentKey ? String(item.statusIncidentKey) : ""
-        return item.statusSeverity + "|" + incidentKey
-    }
-
-    function notificationStatusIncidentKey(value) {
-        var text = String(value || "")
-        var separator = text.indexOf("|")
-        return separator >= 0 ? text.slice(separator + 1) : ""
+        return NotificationMemo.statusMemoValue(item.statusSeverity, incidentKey)
     }
 
     function statusIncidentKey(status) {
@@ -2696,34 +3179,14 @@ PlasmoidItem {
         if (!row || !row.hasPercent) {
             return ""
         }
-        var used = Number(row.usedPercent)
-        if (!isFinite(used)) {
-            return ""
-        }
-        if (used >= 95) {
-            return "major"
-        }
-        if (used >= 80) {
-            return "minor"
-        }
-        return ""
+        return QuotaThresholds.level(
+            row.usedPercent,
+            quotaWarningPercent,
+            quotaCriticalPercent)
     }
 
     function notificationRank(severity) {
-        switch (String(severity || "")) {
-        case "critical":
-            return 5
-        case "major":
-            return 4
-        case "minor":
-            return 3
-        case "maintenance":
-            return 2
-        case "unknown":
-            return 1
-        default:
-            return 0
-        }
+        return NotificationMemo.severityRank(severity)
     }
 
     function notificationUrgency(severity) {
@@ -3817,17 +4280,48 @@ PlasmoidItem {
         }
     }
 
+    // Four- and five-figure totals are unreadable as a bare digit run, and
+    // Number.toLocaleString with 'f' localizes the decimal mark without adding
+    // group separators, so the grouping is applied here.
+    function groupedDecimalString(value, digits) {
+        var numeric = Number(value)
+        if (!isFinite(numeric)) {
+            return "-"
+        }
+        var locale = Qt.locale()
+        var parts = Math.abs(numeric).toFixed(digits).split(".")
+        var whole = parts[0]
+        var grouped = ""
+        for (var i = 0; i < whole.length; i++) {
+            if (i > 0 && (whole.length - i) % 3 === 0) {
+                grouped += locale.groupSeparator
+            }
+            grouped += whole.charAt(i)
+        }
+        return parts.length > 1 ? grouped + locale.decimalPoint + parts[1] : grouped
+    }
+
     function amountString(value, currency) {
         if (currency === "Quota") {
             return Math.round(value).toString()
         }
         var numeric = Number(value)
         var negative = numeric < 0
-        var amount = Math.abs(numeric).toFixed(2)
+        var amount = groupedDecimalString(Math.abs(numeric), 2)
         if (currency === "USD") {
             return negative ? "-$" + amount : "$" + amount
         }
         return (negative ? "-" : "") + currency + " " + amount
+    }
+
+    // Same figures as costLine without the window label, for surfaces that
+    // already state the range once (the Usage & Spend range selector).
+    function costValueLine(cost, tokens, currency) {
+        var costValue = isFinite(Number(cost)) ? amountString(Number(cost), currency) : "-"
+        if (isFinite(Number(tokens))) {
+            return i18n("%1 - %2 tokens", costValue, tokenCountString(Number(tokens)))
+        }
+        return costValue
     }
 
     function costLine(label, cost, tokens, currency) {
@@ -4144,15 +4638,34 @@ PlasmoidItem {
         return primaryProvider()
     }
 
+    function selectGlobalView(viewID) {
+        var candidate = String(viewID || "")
+        if ((candidate === "overview" && !overviewAvailable)
+                || (candidate === "spend" && !spendAvailable)
+                || (candidate === "sessions" && !sessionsAvailable)) {
+            return
+        }
+        if (candidate !== "overview" && candidate !== "spend" && candidate !== "sessions") {
+            return
+        }
+
+        selectedGlobalView = candidate
+        selectedProviderID = ""
+        selectionInitialized = true
+        if (candidate === "sessions" && !sessionsInitialized) {
+            refreshSessions()
+        }
+    }
+
     function updateSelectedProvider() {
         if (!providers || providers.length === 0) {
             return
         }
 
         if (autoSelectProvider) {
-            // Don't override an Overview selection the user explicitly chose;
+            // Don't override a global tab the user explicitly chose;
             // auto-select only drives the initial pick and provider tabs.
-            if (selectionInitialized && overviewSelected) {
+            if (selectionInitialized && globalViewSelected) {
                 return
             }
             selectedProviderID = providers[autoSelectedProviderIndex()].provider
@@ -4162,11 +4675,15 @@ PlasmoidItem {
 
         if (!selectionInitialized) {
             selectedProviderID = overviewAvailable ? "" : providers[0].provider
+            selectedGlobalView = "overview"
             selectionInitialized = true
             return
         }
         if (selectedProviderIndex < 0
-                && (!overviewAvailable || selectedProviderID.length > 0)) {
+                && (!globalViewSelected
+                    || (selectedGlobalView === "overview" && !overviewAvailable)
+                    || (selectedGlobalView === "spend" && !spendAvailable)
+                    || (selectedGlobalView === "sessions" && !sessionsAvailable))) {
             selectedProviderID = providers[0].provider
         }
     }
@@ -4317,6 +4834,9 @@ PlasmoidItem {
         if (mode === "resetTime") {
             return primaryResetText(item)
         }
+        if (mode === "runOut") {
+            return primaryRunOutText(item)
+        }
         return primaryPercentText(item)
     }
 
@@ -4339,6 +4859,17 @@ PlasmoidItem {
             : i18n("%1% pace late", Math.round(shownPace))
     }
 
+    // Duration-only forecast token. It stays empty unless the CLI actually
+    // predicts exhaustion before the reset, so the panel never shows a
+    // countdown the pace data does not support.
+    function primaryRunOutText(item) {
+        var row = switcherMetricRow(item)
+        if (!paceWarningActive(row)) {
+            return ""
+        }
+        return paceEtaText(row.paceEtaSeconds)
+    }
+
     function primaryResetText(item) {
         var row = switcherMetricRow(item)
         var reset = usageResetText(row)
@@ -4348,11 +4879,18 @@ PlasmoidItem {
         return resetLabel(reset)
     }
 
+    // Credit balances are plain counts, so they share the popup's grouped,
+    // locale-aware figure formatting instead of printing a bare digit run with
+    // a hardcoded decimal mark. A whole balance keeps no fractional part, so a
+    // depleted account reads as "0" rather than "0.0".
     function formatNumber(value) {
-        if (Math.abs(value) >= 100) {
-            return Math.round(value).toString()
+        var numeric = Number(value)
+        if (!isFinite(numeric)) {
+            return "-"
         }
-        return Number(value).toFixed(1)
+        var magnitude = Math.abs(numeric)
+        var digits = magnitude >= 100 || magnitude === Math.round(magnitude) ? 0 : 1
+        return (numeric < 0 ? "-" : "") + groupedDecimalString(magnitude, digits)
     }
 
     Plasma5Support.DataSource {
@@ -4371,9 +4909,20 @@ PlasmoidItem {
             }
 
             if (sourceName === root.connectedCostCommandSource) {
+                var costDescriptor = root.activeUsageCommands[sourceName]
+                var requestedHistoryDays = costDescriptor
+                    ? costDescriptor.costHistoryDays
+                    : root.costHistoryDays
                 root.connectedCostCommandSource = ""
                 root.finishUsageCommandSource(sourceName)
-                root.parseCostOutput(stdoutText, stderrText)
+                root.parseCostOutput(stdoutText, stderrText, requestedHistoryDays)
+                return
+            }
+
+            if (sourceName === root.connectedSessionsCommandSource) {
+                root.connectedSessionsCommandSource = ""
+                root.finishUsageCommandSource(sourceName)
+                root.parseSessionsOutput(stdoutText, stderrText)
                 return
             }
 
@@ -4506,10 +5055,20 @@ PlasmoidItem {
     fullRepresentation: Item {
         id: fullRoot
 
+        // A fixed popup height left the Overview half empty whenever few
+        // providers were configured. The content drives the height instead,
+        // clamped so a long provider list still scrolls rather than growing
+        // without bound, and so a nearly empty popup keeps a usable shape.
+        readonly property int maximumPopupHeight: Kirigami.Units.gridUnit * 38
+        readonly property int minimumPopupHeight: Kirigami.Units.gridUnit * 20
+        readonly property int popupContentHeight: Math.ceil(popupContent.implicitHeight)
+            + Kirigami.Units.largeSpacing * 2
+
         implicitWidth: Kirigami.Units.gridUnit * 34
-        implicitHeight: Kirigami.Units.gridUnit * 38
+        implicitHeight: Math.max(minimumPopupHeight,
+            Math.min(maximumPopupHeight, popupContentHeight))
         Layout.minimumWidth: Kirigami.Units.gridUnit * 30
-        Layout.minimumHeight: Kirigami.Units.gridUnit * 28
+        Layout.minimumHeight: Math.min(Kirigami.Units.gridUnit * 28, implicitHeight)
         Layout.preferredWidth: implicitWidth
         Layout.preferredHeight: implicitHeight
 
@@ -4533,6 +5092,8 @@ PlasmoidItem {
         }
 
         ColumnLayout {
+            id: popupContent
+
             anchors.fill: parent
             anchors.margins: Kirigami.Units.largeSpacing
             spacing: Kirigami.Units.largeSpacing
@@ -4540,7 +5101,7 @@ PlasmoidItem {
             Item {
                 id: providerTabsBar
 
-                visible: providers.length > 0
+                visible: providers.length > 0 || spendAvailable || sessionsAvailable
                 Layout.fillWidth: true
                 Layout.preferredHeight: Kirigami.Units.gridUnit * 2.35
 
@@ -4557,6 +5118,80 @@ PlasmoidItem {
                 Flickable {
                     id: providerTabsFlickable
 
+                    // The selected provider tab, so geometry changes can bring it
+                    // back into view without every delegate registering itself.
+                    property Item selectedTab: null
+                    readonly property real tabPageStep: Math.max(Kirigami.Units.gridUnit * 4, width * 0.6)
+                    readonly property real tabWheelStep: Kirigami.Units.gridUnit * 5
+
+                    function scrollTo(position) {
+                        var bounded = Math.max(0, Math.min(contentWidth - width, position))
+                        providerTabsScroll.stop()
+                        providerTabsScroll.to = bounded
+                        providerTabsScroll.start()
+                    }
+
+                    function scrollBy(delta) {
+                        scrollTo(contentX + delta)
+                    }
+
+                    // Tabs come from three different delegates, so walk the parent
+                    // chain instead of keeping a registry of them in sync.
+                    function containsTab(item) {
+                        var node = item
+                        while (node) {
+                            if (node === providerTabs) {
+                                return true
+                            }
+                            node = node.parent
+                        }
+                        return false
+                    }
+
+                    function ensureVisible(item) {
+                        if (!interactive || !item || item.width <= 0 || !containsTab(item)) {
+                            return
+                        }
+                        var margin = Kirigami.Units.gridUnit
+                        var left = item.mapToItem(providerTabs, 0, 0).x
+                        var right = left + item.width
+                        if (left - margin < contentX) {
+                            scrollTo(left - margin)
+                        } else if (right + margin > contentX + width) {
+                            scrollTo(right + margin - width)
+                        }
+                    }
+
+                    // Every tab kind reports through here: tracking only provider
+                    // tabs would leave a stale one selected once a global view is
+                    // picked, and a later resize would scroll it back into view.
+                    function claimSelectedTab(item, isSelected) {
+                        if (!isSelected) {
+                            if (selectedTab === item) {
+                                selectedTab = null
+                            }
+                            return
+                        }
+                        selectedTab = item
+                        ensureVisible(item)
+                    }
+
+                    function revealSelectedTab() {
+                        ensureVisible(selectedTab)
+                    }
+
+                    function focusAdjacentTab(item, forward) {
+                        if (!item) {
+                            return false
+                        }
+                        var candidate = item.nextItemInFocusChain(forward)
+                        if (!candidate || !containsTab(candidate)) {
+                            return false
+                        }
+                        candidate.forceActiveFocus(forward ? Qt.TabFocusReason : Qt.BacktabFocusReason)
+                        return true
+                    }
+
                     anchors.fill: parent
                     anchors.margins: Kirigami.Units.smallSpacing / 2
                     clip: true
@@ -4564,6 +5199,36 @@ PlasmoidItem {
                     contentWidth: providerTabs.implicitWidth
                     contentHeight: height
                     interactive: contentWidth > width
+
+                    onWidthChanged: Qt.callLater(providerTabsFlickable.revealSelectedTab)
+                    onContentWidthChanged: Qt.callLater(providerTabsFlickable.revealSelectedTab)
+
+                    NumberAnimation {
+                        id: providerTabsScroll
+
+                        target: providerTabsFlickable
+                        property: "contentX"
+                        duration: Kirigami.Units.longDuration
+                        easing.type: Easing.OutCubic
+                    }
+
+                    // Touchpads flick this strip horizontally, but a plain mouse
+                    // only sends a vertical wheel, which a horizontal-only
+                    // Flickable ignores; without this the overflowing tabs can
+                    // only be reached by dragging the strip.
+                    WheelHandler {
+                        enabled: providerTabsFlickable.interactive
+                        acceptedDevices: PointerDevice.Mouse
+
+                        onWheel: function(event) {
+                            var delta = event.angleDelta.y !== 0 ? event.angleDelta.y : event.angleDelta.x
+                            if (delta === 0) {
+                                return
+                            }
+                            providerTabsFlickable.scrollBy(
+                                -delta / 120 * providerTabsFlickable.tabWheelStep)
+                        }
+                    }
 
                     RowLayout {
                         id: providerTabs
@@ -4586,8 +5251,11 @@ PlasmoidItem {
                                 : root.withAlpha(Kirigami.Theme.textColor, 0.72)
 
                             function activate() {
-                                root.selectedProviderID = ""
-                                root.selectionInitialized = true
+                                root.selectGlobalView("overview")
+                            }
+
+                            function claimSelectedTab() {
+                                providerTabsFlickable.claimSelectedTab(overviewTab, selected)
                             }
 
                             visible: root.overviewAvailable
@@ -4610,10 +5278,15 @@ PlasmoidItem {
                             activeFocusOnTab: true
 
                             onActiveFocusChanged: {
-                                if (!activeFocus) {
+                                if (activeFocus) {
+                                    providerTabsFlickable.ensureVisible(overviewTab)
+                                } else {
                                     focusAcquiredByPointer = false
                                 }
                             }
+
+                            onSelectedChanged: overviewTab.claimSelectedTab()
+                            Component.onCompleted: overviewTab.claimSelectedTab()
 
                             Accessible.role: Accessible.PageTab
                             Accessible.name: i18n("Overview")
@@ -4630,6 +5303,12 @@ PlasmoidItem {
                                 case Qt.Key_Select:
                                     overviewTab.activate()
                                     event.accepted = true
+                                    break
+                                case Qt.Key_Left:
+                                    event.accepted = providerTabsFlickable.focusAdjacentTab(overviewTab, false)
+                                    break
+                                case Qt.Key_Right:
+                                    event.accepted = providerTabsFlickable.focusAdjacentTab(overviewTab, true)
                                     break
                                 }
                             }
@@ -4698,6 +5377,37 @@ PlasmoidItem {
                             }
                         }
 
+                        Components.GlobalTab {
+                            visible: root.spendAvailable
+                            applet: root
+                            title: i18n("Usage & Spend")
+                            tabStrip: providerTabsFlickable
+                            iconName: "office-chart-bar"
+                            tabHeight: providerTabsFlickable.height
+                            selected: root.spendSelected
+                            onActivated: root.selectGlobalView("spend")
+                        }
+
+                        Components.GlobalTab {
+                            visible: root.sessionsAvailable
+                            applet: root
+                            title: i18n("Sessions")
+                            tabStrip: providerTabsFlickable
+                            iconName: "system-run-symbolic"
+                            tabHeight: providerTabsFlickable.height
+                            selected: root.sessionsSelected
+                            onActivated: root.selectGlobalView("sessions")
+                        }
+
+                        Rectangle {
+                            visible: providers.length > 0
+                                && (root.overviewAvailable || root.spendAvailable || root.sessionsAvailable)
+                            Layout.preferredHeight: providerTabsFlickable.height - Kirigami.Units.smallSpacing * 2
+                            Layout.preferredWidth: 1
+                            Layout.alignment: Qt.AlignVCenter
+                            color: root.withAlpha(Kirigami.Theme.textColor, 0.12)
+                        }
+
                         Repeater {
                             model: providers
 
@@ -4718,6 +5428,12 @@ PlasmoidItem {
                                 function activate() {
                                     root.selectedProviderID = modelData.provider
                                     root.selectionInitialized = true
+                                }
+
+                                // An auto-selected provider can sit past the right
+                                // edge; keep the active tab reachable and visible.
+                                function claimSelectedTab() {
+                                    providerTabsFlickable.claimSelectedTab(providerTab, selected)
                                 }
 
                                 Layout.preferredWidth: Math.min(
@@ -4741,10 +5457,15 @@ PlasmoidItem {
                                 activeFocusOnTab: true
 
                                 onActiveFocusChanged: {
-                                    if (!activeFocus) {
+                                    if (activeFocus) {
+                                        providerTabsFlickable.ensureVisible(providerTab)
+                                    } else {
                                         focusAcquiredByPointer = false
                                     }
                                 }
+
+                                onSelectedChanged: providerTab.claimSelectedTab()
+                                Component.onCompleted: providerTab.claimSelectedTab()
 
                                 Accessible.role: Accessible.PageTab
                                 Accessible.name: modelData.title
@@ -4761,6 +5482,12 @@ PlasmoidItem {
                                     case Qt.Key_Select:
                                         providerTab.activate()
                                         event.accepted = true
+                                        break
+                                    case Qt.Key_Left:
+                                        event.accepted = providerTabsFlickable.focusAdjacentTab(providerTab, false)
+                                        break
+                                    case Qt.Key_Right:
+                                        event.accepted = providerTabsFlickable.focusAdjacentTab(providerTab, true)
                                         break
                                     }
                                 }
@@ -4851,13 +5578,16 @@ PlasmoidItem {
                     }
                 }
 
+                // The fades double as buttons: scrolling the strip otherwise
+                // depends on gestures a plain mouse cannot produce, and nothing
+                // on screen says the tabs continue past the edge.
                 Rectangle {
                     id: providerTabsLeftFade
 
                     anchors.left: parent.left
                     anchors.top: parent.top
                     anchors.bottom: parent.bottom
-                    width: Kirigami.Units.gridUnit
+                    width: Kirigami.Units.gridUnit * 1.5
                     visible: opacity > 0
                     opacity: providerTabsFlickable.interactive && providerTabsFlickable.contentX > 0 ? 1 : 0
                     gradient: Gradient {
@@ -4865,6 +5595,30 @@ PlasmoidItem {
 
                         GradientStop { position: 0; color: Kirigami.Theme.backgroundColor }
                         GradientStop { position: 1; color: root.withAlpha(Kirigami.Theme.backgroundColor, 0) }
+                    }
+
+                    Accessible.role: Accessible.Button
+                    Accessible.name: i18n("Show previous tabs")
+                    Accessible.onPressAction: providerTabsFlickable.scrollBy(-providerTabsFlickable.tabPageStep)
+
+                    Kirigami.Icon {
+                        anchors.centerIn: parent
+                        width: Kirigami.Units.iconSizes.small
+                        height: width
+                        source: "go-previous-symbolic"
+                        isMask: true
+                        color: providerTabsLeftFadeMouse.containsMouse
+                            ? root.readableAccentColor(Kirigami.Theme.highlightColor, Kirigami.Theme.backgroundColor)
+                            : root.withAlpha(Kirigami.Theme.textColor, 0.72)
+                    }
+
+                    MouseArea {
+                        id: providerTabsLeftFadeMouse
+
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: providerTabsFlickable.scrollBy(-providerTabsFlickable.tabPageStep)
                     }
 
                     Behavior on opacity {
@@ -4880,7 +5634,7 @@ PlasmoidItem {
                     anchors.right: parent.right
                     anchors.top: parent.top
                     anchors.bottom: parent.bottom
-                    width: Kirigami.Units.gridUnit
+                    width: Kirigami.Units.gridUnit * 1.5
                     visible: opacity > 0
                     opacity: providerTabsFlickable.interactive
                         && providerTabsFlickable.contentX < providerTabsFlickable.contentWidth - providerTabsFlickable.width - 1 ? 1 : 0
@@ -4889,6 +5643,30 @@ PlasmoidItem {
 
                         GradientStop { position: 0; color: root.withAlpha(Kirigami.Theme.backgroundColor, 0) }
                         GradientStop { position: 1; color: Kirigami.Theme.backgroundColor }
+                    }
+
+                    Accessible.role: Accessible.Button
+                    Accessible.name: i18n("Show more tabs")
+                    Accessible.onPressAction: providerTabsFlickable.scrollBy(providerTabsFlickable.tabPageStep)
+
+                    Kirigami.Icon {
+                        anchors.centerIn: parent
+                        width: Kirigami.Units.iconSizes.small
+                        height: width
+                        source: "go-next-symbolic"
+                        isMask: true
+                        color: providerTabsRightFadeMouse.containsMouse
+                            ? root.readableAccentColor(Kirigami.Theme.highlightColor, Kirigami.Theme.backgroundColor)
+                            : root.withAlpha(Kirigami.Theme.textColor, 0.72)
+                    }
+
+                    MouseArea {
+                        id: providerTabsRightFadeMouse
+
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: providerTabsFlickable.scrollBy(providerTabsFlickable.tabPageStep)
                     }
 
                     Behavior on opacity {
@@ -4907,47 +5685,67 @@ PlasmoidItem {
             Kirigami.InlineMessage {
                 id: globalErrorMessage
 
-                visible: errorText.length > 0
+                visible: root.providerUsageFeedbackVisible && errorText.length > 0
                 text: errorText
                 type: Kirigami.MessageType.Error
                 Layout.fillWidth: true
             }
 
-            RowLayout {
-                visible: providers.length === 0 && errorText.length === 0 && loading
+            // A plain Item absorbs the leftover popup height; a RowLayout here
+            // inherits its children's maximum height, so the layout engine would
+            // spread the slack across every row and push the tab bar downwards.
+            Item {
+                id: providerUsageLoadingRow
+
+                visible: root.providerUsageFeedbackVisible
+                    && providers.length === 0
+                    && errorText.length === 0
+                    && loading
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                spacing: Kirigami.Units.smallSpacing
 
-                Item {
-                    Layout.fillWidth: true
-                }
+                RowLayout {
+                    anchors.centerIn: parent
+                    width: Math.min(implicitWidth, parent.width)
+                    spacing: Kirigami.Units.smallSpacing
 
-                Controls.BusyIndicator {
-                    running: parent.visible
-                    Layout.preferredWidth: Kirigami.Units.iconSizes.medium
-                    Layout.preferredHeight: Kirigami.Units.iconSizes.medium
-                }
+                    Controls.BusyIndicator {
+                        running: providerUsageLoadingRow.visible
+                        Layout.preferredWidth: Kirigami.Units.iconSizes.medium
+                        Layout.preferredHeight: Kirigami.Units.iconSizes.medium
+                    }
 
-                PlasmaComponents.Label {
-                    text: i18n("Loading usage...")
-                    opacity: root.secondaryTextOpacity
-                }
-
-                Item {
-                    Layout.fillWidth: true
+                    PlasmaComponents.Label {
+                        text: i18n("Loading usage...")
+                        opacity: root.secondaryTextOpacity
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                    }
                 }
             }
 
             Kirigami.PlaceholderMessage {
                 id: emptyProvidersMessage
 
-                visible: providers.length === 0 && errorText.length === 0 && !loading
+                visible: providers.length === 0
+                    && !root.globalViewSelected
+                    && errorText.length === 0
+                    && !loading
                 text: i18n("No provider data.")
                 icon.name: "view-statistics-symbolic"
                 type: Kirigami.PlaceholderMessage.Type.Informational
                 Layout.fillWidth: true
                 Layout.fillHeight: true
+            }
+
+            Components.SpendView {
+                visible: root.spendSelected
+                applet: root
+            }
+
+            Components.SessionsView {
+                visible: root.sessionsSelected
+                applet: root
             }
 
             ColumnLayout {
@@ -4987,9 +5785,19 @@ PlasmoidItem {
                         }
                     }
 
+                    // A refresh over data that is already on screen used to show
+                    // nothing here but a greyed button, so the only sign of work
+                    // was the spinning panel icon behind the popup.
+                    Controls.BusyIndicator {
+                        visible: root.loading
+                        running: visible
+                        Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium
+                        Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium
+                    }
+
                     PlasmaComponents.ToolButton {
+                        visible: !root.loading
                         icon.name: "view-refresh"
-                        enabled: !loading
                         Accessible.name: i18n("Refresh")
                         onClicked: root.refreshNow()
                     }
@@ -5132,35 +5940,11 @@ PlasmoidItem {
                                 Layout.fillWidth: true
                             }
 
-                            Rectangle {
-                                // A depleted balance draws an empty track that is
-                                // indistinguishable from a meter that has not loaded
-                                // yet, so let the remaining-credits line carry the
-                                // zero case on its own.
-                                visible: root.selectedProviderData && root.selectedProviderData.credits > 0
-                                Layout.fillWidth: true
-                                Layout.preferredHeight: root.meterTrackHeight
-                                radius: height / 2
-                                color: root.withAlpha(Kirigami.Theme.textColor, 0.1)
-                                clip: true
-
-                                Rectangle {
-                                    width: root.selectedProviderData && root.selectedProviderData.credits > 0
-                                        ? Math.max(parent.height, parent.width * Math.min(root.selectedProviderData.credits, 1000) / 1000)
-                                        : 0
-                                    height: parent.height
-                                    radius: parent.radius
-                                    color: root.providerReadableColor(root.selectedProviderData ? root.selectedProviderData.provider : "")
-
-                                    Behavior on width {
-                                        NumberAnimation {
-                                            duration: Kirigami.Units.longDuration
-                                            easing.type: Easing.OutCubic
-                                        }
-                                    }
-                                }
-                            }
-
+                            // `usage.credits` reports only `remaining`, so a meter
+                            // here has to invent its own denominator and then
+                            // fills or empties for reasons the balance never
+                            // describes. The figure stands alone until the CLI
+                            // reports the matching allowance.
                             RowLayout {
                                 Layout.fillWidth: true
                                 spacing: Kirigami.Units.smallSpacing
@@ -5438,57 +6222,19 @@ PlasmoidItem {
                                 elide: Text.ElideRight
                             }
 
-                            Canvas {
-                                id: costSparkline
-
+                            Components.InteractiveChart {
                                 readonly property var tokenCost: tokenCostSection.tokenCost
                                 readonly property var providerData: root.selectedProviderData
 
-                                property var points: tokenCost ? tokenCost.daily : []
-                                readonly property real maxValue: root.costSparklineMax(points)
-                                readonly property color accent: root.providerReadableColor(providerData ? providerData.provider : "")
-
-                                visible: points.length > 1 && maxValue > 0
-                                Layout.fillWidth: true
-                                Layout.preferredHeight: Kirigami.Units.gridUnit * 3.25
+                                visible: tokenCost && tokenCost.daily.length > 1
+                                applet: root
+                                points: root.costChartPoints(tokenCost ? tokenCost.daily : [])
+                                accent: root.providerReadableColor(providerData ? providerData.provider : "")
+                                kind: "bar"
+                                accessibleTitle: root.costHistoryShowsTokens
+                                    ? i18n("Daily token history")
+                                    : i18n("Daily cost history")
                                 Layout.topMargin: Kirigami.Units.smallSpacing / 2
-
-                                onPointsChanged: requestPaint()
-                                onMaxValueChanged: requestPaint()
-                                onWidthChanged: requestPaint()
-                                onHeightChanged: requestPaint()
-                                onVisibleChanged: if (visible) requestPaint()
-
-                                onPaint: {
-                                    var ctx = getContext("2d")
-                                    ctx.clearRect(0, 0, width, height)
-                                    if (!points || points.length < 2 || maxValue <= 0 || width <= 0 || height <= 0) {
-                                        return
-                                    }
-
-                                    var geometry = root.chartBarGeometry(width, points.length)
-                                    var baseline = height - 1
-
-                                    ctx.fillStyle = root.canvasColor(Kirigami.Theme.textColor, 0.1)
-                                    ctx.fillRect(0, baseline, width, 1)
-
-                                    var peakFill = root.buildChartBarGradient(
-                                        ctx, costSparkline.accent, baseline, 0.96, 0.58)
-                                    var normalFill = root.buildChartBarGradient(
-                                        ctx, costSparkline.accent, baseline, 0.7, 0.3)
-                                    for (var i = 0; i < points.length; i++) {
-                                        var value = Math.max(0, Number(points[i].cost) || 0)
-                                        var barHeight = Math.max(2, (height - 3) * value / maxValue)
-                                        ctx.fillStyle = value === maxValue ? peakFill : normalFill
-                                        root.paintRoundedTopBar(
-                                            ctx,
-                                            i * geometry.step,
-                                            baseline,
-                                            geometry.barWidth,
-                                            barHeight,
-                                            Kirigami.Units.smallSpacing / 2)
-                                    }
-                                }
                             }
 
                             RowLayout {

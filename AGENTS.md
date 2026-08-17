@@ -54,14 +54,49 @@ Use this order when sources disagree:
   exposes canonical metadata, consume it and retain cheap drift tests for any
   remaining fallback map.
 
-## Working Method
+## Working Style
+
+- Finish the full requested scope. Progress notes and plans do not substitute
+  for implementation. If one part is genuinely blocked, complete every
+  independent part and state the exact blocker in one sentence.
+- Distinguish questions from change requests. Answer requests to evaluate,
+  explain, or diagnose without modifying files. Verbs such as `fix`,
+  `implement`, `change`, `add`, `remove`, and `refactor` authorize the smallest
+  complete in-scope change.
+- Act by default when a step is reversible, low-cost, and clearly in scope. Use
+  available tools to inspect files, search code, read documentation, reproduce
+  bugs, compare implementations, make scoped edits, and run tests before asking
+  the user for missing details. Fix safe, in-scope problems instead of returning
+  them as user to-dos.
+- Ask first when an action reaches an external audience, is destructive or hard
+  to undo, can create meaningful cost, or when plausible interpretations would
+  produce materially different results.
+- Prefer the smallest complete solution. Avoid unrelated cleanup, abstractions,
+  features, dependencies, formatting churn, and architecture changes. Never
+  reduce the requested scope silently.
+- Understand the surrounding implementation and existing conventions before
+  changing established behavior. Preserve compatibility, tests, safeguards,
+  error handling, and unexpected behavior unless evidence or the request shows
+  that they must change.
+- Parallelize independent work only when it saves meaningful time. Use subagents
+  only for substantial independent tasks, keep their files and logical areas
+  disjoint, and continue useful main-thread work while they run.
+- Apply the normal verification for the change: focused tests, linting, type
+  checks, builds, reproduction, and diff inspection as appropriate. Avoid
+  redundant passes. Never claim a check passed when it failed or was not run;
+  state the specific reason when verification is unavailable.
+- Communicate in direct technical English with short sentences and paragraphs.
+  During longer tasks, report only useful new progress. Keep the final response
+  short: what changed, whether it worked, and what the user must do next. Say
+  explicitly when no action is needed. When a choice remains, present at most
+  two good options, explain the practical difference, and recommend one.
+
+## Repository Workflow
 
 - Before editing, identify the requested Plasma surface, its owning QML file,
   the config entry if any, the CLI payload involved, and the nearest regression
   check. If the requested behavior belongs upstream, report that boundary before
   writing frontend code.
-- Make the smallest coherent change that satisfies the request. Avoid unrelated
-  refactors, formatting churn, generated artifacts, and changes in sibling repos.
 - Preserve user changes in a dirty worktree. Review `git diff` and `git status`
   before handing off, and call out unrelated pre-existing changes rather than
   incorporating them silently.
@@ -69,8 +104,8 @@ Use this order when sources disagree:
   data changes, static QML assertions for durable UI rules, and runtime checks
   only when static checks cannot establish the behavior.
 - Run the narrowest relevant check while iterating, then the repository-required
-  checks before completion. Never claim packaging or runtime verification unless
-  it was actually performed; state clearly what was not available.
+  checks before completion. Packaging and runtime checks count only when they
+  were actually performed.
 - When a parity decision changes, update `TODO.md` and the mirror below in the
   same change so future agents do not revive a rejected port or obsolete gap.
 
@@ -82,6 +117,11 @@ Use this order when sources disagree:
 - Never log, display, persist, or pass through raw API keys, cookies, bearer
   tokens, auth headers, or unredacted diagnostics. Secret entry must use supported
   CLI stdin flows and redacted result contracts.
+- A secret must never appear anywhere in a command line, including as a shell
+  positional argument piped to stdin: `/proc/<pid>/cmdline` is world-readable
+  while the child runs. Only `promptDescriptorSecret` may carry a secret, because
+  it reads the value inside the script. Generic field writers must reject
+  `kind === "secret"` instead of growing a stdin channel.
 - Keep command nonce, timeout, disconnect, retry, and stale-result handling close
   to each external process lifecycle. A late process result must not overwrite a
   newer refresh or account selection.
@@ -138,15 +178,15 @@ Use this order when sources disagree:
 ## Current TODO Mirror
 
 Keep this in sync with `TODO.md` when feature parity decisions change. Current
-parity baseline: `docs/research/2026-08-15-macos-parity-0.49.6.md` (upstream
-v0.49.6, probed against the installed CLI 0.49.6).
+parity baseline: `docs/research/2026-08-16-macos-parity-0.50.0.md` (upstream
+v0.50.0, probed against the installed CLI 0.50.0).
 
 - Provider-specific editing should come from a stable CLI descriptor, not
   duplicated provider-specific config logic in QML. The Providers page renders
   descriptor fields/actions from `docs/cli-provider-settings-descriptor.md` for
   generic source mode, API key, cookie source/manual cookie, enterprise/base
   URL, workspace/project ID, region, AWS profile/auth mode, and boolean extras.
-  That descriptor is a proposal, not shipped: on CLI 0.49.6
+  That descriptor is a proposal, not shipped: on CLI 0.50.0
   `config providers --descriptors` fails with `Unknown option --descriptors` and
   the plain payload has no `descriptor` key, so the path is dormant and the page
   falls back to enable/disable, `set-api-key` and links. Keep that fallback
@@ -164,29 +204,44 @@ v0.49.6, probed against the installed CLI 0.49.6).
   surfaced, with legacy dashboard KPI/summary payloads retained as a
   compatibility fallback. Richer provider-specific layouts, billing summaries,
   usage breakdowns, credits history, and model/request/token sections should
-  wait for stable CLI presentation fields.
-- Quota warning thresholds are hardcoded at 80/95 in `main.qml`; macOS makes
-  them configurable. No CLI contract blocks a Plasma equivalent.
-- `codexbar sessions --json-v2` is stable and unconsumed. A local Agent Sessions
-  list is implementable now; remote/SSH host focus is macOS-only. Treat
-  `projectName`, `host`, and `transcriptPath` as untrusted display text and do
-  not open or follow transcript paths.
-- Interactive history charts can build on the current cost history bars.
-  Hover/selection is implementable now on the charts that already render;
-  credits history and plan utilization history should wait for stable history
-  payloads. Avoid heavy delegate work. Compact burn-down/history views may be
-  useful Plasma equivalents to macOS widgets.
-- Panel element composition lags macOS, which has a draggable, saveable
-  menu-bar chip layout against our `menuBarDisplayMode` plus four booleans. A
-  configurable element order needs no CLI change.
+  wait for stable CLI presentation fields. `usage.credits` carries no allowance,
+  so the Credits section prints the balance without a meter; do not reintroduce
+  a meter with a hardcoded denominator.
+- Quota warning thresholds are user-configurable and bounded by
+  `contents/ui/QuotaThresholds.js`; the notification level and the usage-bar
+  markers both read them, so neither may hardcode a percentage. Changing a
+  threshold must reset the threshold-derived notification memo, but must keep
+  the provider status baseline: a settings change is not a status transition,
+  and dropping the baseline either re-announces an ongoing incident or swallows
+  one that starts while the provider is still refreshing. That decision lives in
+  `contents/ui/NotificationMemo.js` and is covered behaviourally by
+  `tests/tst_notification_memo.qml`; keep it there instead of reinlining it in
+  `main.qml`, which owns only the memo property and the notification call.
+  Per-provider thresholds stay blocked on the CLI descriptor.
+- `codexbar sessions --json-v2` feeds a bounded local Sessions tab. Normalize
+  only safe display fields; never retain, render, open, or follow `cwd`,
+  `transcriptPath`, IDs, or PIDs. Remote/SSH host focus is macOS-only.
+- Existing detail and cost charts support pointer and keyboard inspection; the
+  Usage & Spend tab adds bounded range and heatmap views. Credits history, plan
+  utilization history, and session-equivalent forecasts must wait for stable
+  CLI history payloads.
+- `costHistoryMetric` switches every cost chart between cost and tokens from the
+  same `cost` payload; never add a CLI call for the metric, and keep the bar
+  scale reading the selected metric. `historyCoverageIsEstablished` drives the
+  "still collecting" note, and a missing flag counts as established.
+- Panel element composition has a persisted, sanitized order for identity,
+  status, usage text, and meters. Keep existing visibility settings working.
+  The `runOut` display mode stays tied to `paceWarningActive`, so it prints a
+  duration only when the CLI predicts exhaustion before the reset.
 - Gettext template extraction exists. Real `.po` catalogs, compiled catalog
   packaging, and translator contribution docs should come with localization
   work.
-- Notification refinements should stay quiet, configurable, and tied to clear
-  state transitions.
+- Predictive pace warnings are opt-in, CLI-backed, silently primed, and tied to
+  a new projected-exhaustion transition. Other notification refinements should
+  stay quiet, configurable, and tied to clear state transitions.
 - The fallback catalog covers the 69 provider IDs released in CodexBar v0.49.1
   and retains fork-only compatibility assets. Re-verified against the installed
-  0.49.6 CLI, which reports the same 69 and adds none. Future drift syncs should
+  0.50.0 CLI, which reports the same 69 and adds none. Future drift syncs should
   cover provider keys, CLI aliases, titles, colors, docs/dashboard/login URLs,
   icon assets, and `scripts/test_provider_icons.sh`.
 - The GitHub Release updater is current. If a KDE Store channel is added,

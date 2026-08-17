@@ -1,14 +1,14 @@
 # TODO
 
-Parity baseline: `docs/research/2026-08-15-macos-parity-0.49.6.md`, pinned to
-upstream v0.49.6 and probed against the installed CLI 0.49.6.
+Parity baseline: `docs/research/2026-08-16-macos-parity-0.50.0.md`, pinned to
+upstream v0.50.0 and probed against the installed CLI 0.50.0.
 
 - Provider-specific editable settings: the Providers page renders generic
   fields/actions from `docs/cli-provider-settings-descriptor.md` without
   provider-specific QML branches. Declared coverage includes source mode, API
   key, cookie source/manual cookie, enterprise/base URL, workspace/project ID,
   region, AWS profile/auth mode, and boolean extras. That descriptor is still a
-  *proposal*: on CLI 0.49.6 `config providers --descriptors` returns
+  *proposal*: on CLI 0.50.0 `config providers --descriptors` returns
   `Unknown option --descriptors` and the plain payload carries no `descriptor`
   key, so the whole path is dormant and the page degrades to enable/disable,
   `set-api-key` and docs/dashboard/login links. Keep that fallback working.
@@ -30,30 +30,51 @@ upstream v0.49.6 and probed against the installed CLI 0.49.6.
   the CLI extends that stable presentation contract. Missing examples include
   billing summaries, usage breakdowns, credits history, and richer
   provider-specific model/request/token sections.
-- Configurable quota warning thresholds: `quotaNotificationLevel()` and
-  `quotaWarningMarkers()` in `main.qml` hardcode 80/95, while macOS exposes them
-  in a dedicated Notifications pane. No CLI contract is involved, so this is the
-  smallest real parity gap fully under Plasma control.
-- Local Agent Sessions list: `codexbar sessions --json-v2` is stable and
-  verified on 0.49.6 but is never consumed by the widget. Bound `projectName`,
-  `host` and `transcriptPath` as untrusted display text, and do not open or
-  follow transcript paths. Remote/SSH host focus stays macOS-only.
-- Interactive history charts: hover/selection is implementable now on the cost
-  sparkline and detail charts that already render; credits and plan-utilization
-  history still need stable CLI history payloads. Consider compact
-  burn-down/history views as Plasma equivalents to the macOS WidgetKit widgets,
-  but avoid heavy delegate work in QML.
-- Panel element composition: macOS has a draggable, saveable menu-bar chip
-  layout; Plasma has `menuBarDisplayMode` plus four booleans. A configurable
-  element order would close most of that gap with no CLI change.
+- Credits allowance: `usage.credits` reports `remaining`, `updatedAt`, and
+  `events` only. With no allowance or plan total, the Credits section prints the
+  balance without a meter; the meter it replaced scaled against a hardcoded 1000
+  credits and so filled for reasons the payload never described. Restore a meter
+  only when the CLI reports the matching allowance.
+- Cost history plots either cost or tokens through `costHistoryMetric`; the
+  selector drives the range chart, the heatmap, and the per-provider bars from
+  one `cost` payload, so it must never add a CLI call. `historyCoverageIsEstablished`
+  drives the "still collecting" note; a missing flag means established.
+- Quota warning thresholds are configurable through `quotaWarningPercent` and
+  `quotaCriticalPercent`, bounded by `contents/ui/QuotaThresholds.js`, and drive
+  both the notification level and the usage-bar markers. Per-provider thresholds
+  stay blocked on the CLI descriptor. Do not reintroduce literal percentages at
+  a call site; `limitResetArmThreshold` is a separate reset-detection knob and
+  is deliberately not tied to the warning step. Changing a threshold resets the
+  threshold-derived notification memo but keeps the provider status baseline: a
+  settings change is not a status transition. That decision lives in
+  `contents/ui/NotificationMemo.js` and is covered by
+  `tests/tst_notification_memo.qml`; keep it there rather than reinlining it in
+  `main.qml`.
+- Local Agent Sessions are consumed through `codexbar sessions --json-v2` in a
+  bounded, refreshable global tab. Only safe display fields are normalized;
+  `cwd`, `transcriptPath`, IDs, and PIDs are neither retained nor rendered.
+  Remote/SSH host focus stays macOS-only.
+- Existing detail and cost charts now support hover, click selection, and
+  keyboard inspection. The global Usage & Spend tab adds 7/30/90-day cost
+  ranges and a bounded activity heatmap. Credits history, plan-utilization
+  history, and session-equivalent forecasts still need stable CLI history
+  payloads; do not infer history from one snapshot.
+- Panel element composition now has a persisted, sanitized order for identity,
+  status, usage text, and per-provider usage entries. Visibility remains controlled by the
+  existing Plasma-native display settings. The `runOut` display mode shows the
+  predicted duration only while the CLI pace forecast reports exhaustion before
+  the reset; keep it tied to `paceWarningActive` instead of the percent used.
+  The macOS weekly reserve token is the remaining panel-presentation gap.
 - Translations: gettext template extraction is in place. Add real `.po`
   catalogs, compiled catalog packaging, and translator contribution docs when
   localization work starts.
-- Notification refinements: consider reset-imminent notifications if they stay
-  quiet and configurable. Keep status, quota, reset, and update notifications
-  tied to clear state transitions and user-visible settings.
+- Predictive pace warnings are opt-in and consume the CLI `pace` forecast; they
+  silently prime the current state and notify only on a new projected
+  exhaustion. Consider reset-imminent notifications only if they remain quiet,
+  configurable, and tied to clear state transitions.
 - Provider drift checks: the Plasma fallback catalog covers all 69 provider IDs
-  released in CodexBar v0.49.1, while retaining fork-only compatibility assets.
+  released in CodexBar v0.49.1 and re-verified on 0.50.0, while retaining
+  fork-only compatibility assets.
   When upstream releases providers, sync provider keys, CLI aliases, titles,
   colors, docs/dashboard/login URLs, icon assets, and
   `scripts/test_provider_icons.sh`.

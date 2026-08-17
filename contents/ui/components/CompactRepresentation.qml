@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls as Controls
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
+import org.kde.plasma.components as PlasmaComponents
 
 Item {
     id: compactRoot
@@ -9,15 +10,20 @@ Item {
     required property var applet
 
     readonly property bool verticalPanel: applet.verticalFormFactor
-    readonly property var multiProviderItems: applet.compactProviders()
-    readonly property bool hasProviderEntries: multiProviderItems.length > 0
+    readonly property bool hasProviderEntries: applet.compactProviders().length > 0
     readonly property var incidentProvider: applet.primaryIncidentProvider()
-    // Vertical panels collapse to a bare icon. Horizontal multi-provider panels
-    // render one icon + text entry per provider, so the leading identity icon
-    // only reappears there while a refresh is running to keep the spinner.
-    readonly property bool showIdentityIcon: compactRoot.verticalPanel
+    readonly property string primaryText: applet.compactText()
+    // Every multi-provider entry carries its own provider icon, so the leading
+    // identity icon stays for vertical panels, the loading spinner, and the
+    // single-provider layout; it would otherwise duplicate the first entry.
+    readonly property bool showIdentityElement: compactRoot.verticalPanel
+        || !compactRoot.hasProviderEntries
         || (compactRoot.applet.loading && compactRoot.hasProviderEntries)
-    readonly property bool showPrimaryEntry: !compactRoot.verticalPanel && !compactRoot.hasProviderEntries
+    readonly property bool showTextElement: !compactRoot.verticalPanel
+        && !compactRoot.hasProviderEntries
+        && compactRoot.primaryText.length > 0
+    readonly property bool showProviderEntries: !compactRoot.verticalPanel
+        && compactRoot.hasProviderEntries
     readonly property int compactExtent: Kirigami.Units.iconSizes.smallMedium
         + Kirigami.Units.smallSpacing * 2
     readonly property int compactMinimumWidth: Kirigami.Units.gridUnit * 4.8
@@ -50,62 +56,128 @@ Item {
         onClicked: compactRoot.applet.expanded = !compactRoot.applet.expanded
     }
 
+    // Measure outside the Loader so its layout-assigned width cannot feed back
+    // into the label's preferred width and collapse the compact representation.
+    PlasmaComponents.Label {
+        id: compactTextMeasurer
+
+        visible: false
+        text: compactRoot.primaryText
+        font.bold: true
+    }
+
     RowLayout {
         id: compactRow
 
-        anchors.fill: parent
-        anchors.margins: Kirigami.Units.smallSpacing
+        // The applet keeps a minimum panel width, so a short content set (text
+        // or entries without a status incident) leaves spare room. Centre the
+        // row instead of letting all of it pile up on the right of the content.
+        anchors.centerIn: parent
+        width: Math.max(0, Math.min(compactRoot.width - Kirigami.Units.smallSpacing * 2,
+            implicitWidth))
+        height: Math.max(0, compactRoot.height - Kirigami.Units.smallSpacing * 2)
         spacing: Kirigami.Units.smallSpacing
 
-        Kirigami.Icon {
-            id: compactIdentityIcon
+        Repeater {
+            model: compactRoot.applet.panelElementOrder()
 
-            readonly property string compactProvider: compactRoot.applet.selectedCompactProvider() ? compactRoot.applet.selectedCompactProvider().provider : "codex"
+            delegate: Loader {
+                id: elementLoader
 
-            visible: compactRoot.showIdentityIcon
-            source: compactRoot.applet.loading ? "view-refresh" : compactRoot.applet.providerIconSource(compactProvider)
-            fallback: "view-statistics"
-            isMask: !compactRoot.applet.loading && compactRoot.applet.providerIconIsMask(compactProvider)
-            color: compactRoot.applet.loading
-                ? Kirigami.Theme.textColor
-                : compactRoot.applet.providerReadableColor(compactProvider, Kirigami.Theme.backgroundColor)
-            Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium
-            Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium
-            Layout.alignment: Qt.AlignCenter
+                required property var modelData
 
-            RotationAnimator {
-                target: compactIdentityIcon
-                running: compactRoot.applet.loading
-                from: 0
-                to: 360
-                duration: 1250
-                loops: Animation.Infinite
-                onStopped: compactIdentityIcon.rotation = 0
-            }
+                readonly property bool isTextElement: modelData === "text"
+                readonly property bool isMetersElement: modelData === "meters"
+                readonly property bool elementVisible: modelData === "identity"
+                    ? compactRoot.showIdentityElement
+                    : (modelData === "status"
+                    ? (!compactRoot.verticalPanel
+                        && compactRoot.incidentProvider !== null
+                        && compactRoot.incidentProvider.hasIncident)
+                    : (modelData === "text"
+                    ? compactRoot.showTextElement
+                    : compactRoot.showProviderEntries))
 
-            // The inline badge below needs horizontal room the vertical strip does
-            // not have, so overlay the incident marker on the identity icon instead
-            // of dropping the only at-a-glance status signal. Hidden while the icon
-            // spins so the marker does not orbit the refresh indicator.
-            Rectangle {
-                id: compactVerticalStatusBadge
-
-                visible: compactRoot.verticalPanel
-                    && !compactRoot.applet.loading
-                    && compactRoot.incidentProvider !== null
-                    && compactRoot.incidentProvider.hasIncident
-                anchors.top: parent.top
-                anchors.right: parent.right
-                width: Math.round(Kirigami.Units.iconSizes.smallMedium / 3)
-                height: width
-                radius: width / 2
-                color: compactRoot.incidentProvider
-                    ? compactRoot.applet.statusBadgeColor(compactRoot.incidentProvider.statusSeverity)
-                    : "transparent"
-                border.width: 1
-                border.color: Kirigami.Theme.backgroundColor
+                sourceComponent: modelData === "identity"
+                    ? identityElement
+                    : (modelData === "status"
+                    ? statusElement
+                    : (modelData === "text" ? textElement : metersElement))
+                visible: elementVisible
+                Layout.fillWidth: elementVisible && (isTextElement || isMetersElement)
+                Layout.preferredWidth: !elementVisible
+                    ? 0
+                    : (modelData === "identity"
+                    ? Kirigami.Units.iconSizes.smallMedium
+                    : (modelData === "status"
+                    ? Kirigami.Units.smallSpacing * 1.5
+                    : (modelData === "meters"
+                    ? implicitWidth
+                    : Math.max(Kirigami.Units.gridUnit * 2,
+                        Math.ceil(compactTextMeasurer.implicitWidth)))))
+                Layout.preferredHeight: compactRow.height
+                Layout.alignment: Qt.AlignVCenter
             }
         }
+    }
+
+    Component {
+        id: identityElement
+
+        Item {
+            readonly property string compactProvider: compactRoot.applet.selectedCompactProvider()
+                ? compactRoot.applet.selectedCompactProvider().provider
+                : "codex"
+
+            visible: compactRoot.showIdentityElement
+            implicitWidth: Kirigami.Units.iconSizes.smallMedium
+            implicitHeight: Kirigami.Units.iconSizes.smallMedium
+
+            Kirigami.Icon {
+                id: compactIdentityIcon
+
+                anchors.fill: parent
+                source: compactRoot.applet.loading ? "view-refresh" : compactRoot.applet.providerIconSource(parent.compactProvider)
+                fallback: "view-statistics"
+                isMask: !compactRoot.applet.loading && compactRoot.applet.providerIconIsMask(parent.compactProvider)
+                color: compactRoot.applet.loading
+                    ? Kirigami.Theme.textColor
+                    : compactRoot.applet.providerReadableColor(parent.compactProvider, Kirigami.Theme.backgroundColor)
+
+                RotationAnimator {
+                    target: compactIdentityIcon
+                    running: compactRoot.applet.loading
+                    from: 0
+                    to: 360
+                    duration: 1250
+                    loops: Animation.Infinite
+                    onStopped: compactIdentityIcon.rotation = 0
+                }
+
+                Rectangle {
+                    id: compactVerticalStatusBadge
+
+                    visible: compactRoot.verticalPanel
+                        && !compactRoot.applet.loading
+                        && compactRoot.incidentProvider !== null
+                        && compactRoot.incidentProvider.hasIncident
+                    anchors.top: parent.top
+                    anchors.right: parent.right
+                    width: Math.round(Kirigami.Units.iconSizes.smallMedium / 3)
+                    height: width
+                    radius: width / 2
+                    color: compactRoot.incidentProvider
+                        ? compactRoot.applet.statusBadgeColor(compactRoot.incidentProvider.statusSeverity)
+                        : "transparent"
+                    border.width: 1
+                    border.color: Kirigami.Theme.backgroundColor
+                }
+            }
+        }
+    }
+
+    Component {
+        id: statusElement
 
         Rectangle {
             id: compactStatusBadge
@@ -113,8 +185,8 @@ Item {
             visible: !compactRoot.verticalPanel
                 && compactRoot.incidentProvider !== null
                 && compactRoot.incidentProvider.hasIncident
-            Layout.preferredWidth: Kirigami.Units.smallSpacing * 1.5
-            Layout.preferredHeight: Kirigami.Units.smallSpacing * 1.5
+            implicitWidth: Kirigami.Units.smallSpacing * 1.5
+            implicitHeight: implicitWidth
             radius: width / 2
             color: compactRoot.incidentProvider
                 ? compactRoot.applet.statusBadgeColor(compactRoot.incidentProvider.statusSeverity)
@@ -133,23 +205,40 @@ Item {
                 acceptedButtons: Qt.NoButton
             }
         }
+    }
 
-        CompactProviderEntry {
-            id: compactPrimaryEntry
+    Component {
+        id: textElement
 
-            visible: compactRoot.showPrimaryEntry
-            applet: compactRoot.applet
-            modelData: compactRoot.applet.selectedCompactProvider()
-            showSpinner: true
-            Layout.fillWidth: true
+        PlasmaComponents.Label {
+            visible: compactRoot.showTextElement
+            text: compactRoot.primaryText
+            elide: Text.ElideRight
+            font.bold: true
+            // The loader stretches this label to the full row height, so the
+            // default top alignment would sit the text above the centred
+            // provider icon beside it.
+            verticalAlignment: Text.AlignVCenter
         }
+    }
 
-        Repeater {
-            model: compactRoot.verticalPanel ? [] : compactRoot.multiProviderItems
+    // The multi-provider "meters" element renders one icon + usage-text entry
+    // per provider instead of the old thumbnail meters; the element keeps its
+    // persisted identifier so existing element-order configuration still works.
+    Component {
+        id: metersElement
 
-            delegate: CompactProviderEntry {
-                applet: compactRoot.applet
-                Layout.fillWidth: true
+        RowLayout {
+            visible: compactRoot.showProviderEntries
+            spacing: Kirigami.Units.smallSpacing
+
+            Repeater {
+                model: compactRoot.applet.compactProviders()
+
+                delegate: CompactProviderEntry {
+                    applet: compactRoot.applet
+                    Layout.fillWidth: true
+                }
             }
         }
     }

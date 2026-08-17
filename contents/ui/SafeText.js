@@ -3,6 +3,7 @@
 var maximumCliMessageLength = 500
 var maximumDiagnosticLength = 65536
 var maximumCliJsonLength = 4 * 1024 * 1024
+var credentialRedactionLookaheadLength = 64
 
 function safeLimit(maximumLength, fallback) {
     var limit = Number(maximumLength)
@@ -12,9 +13,10 @@ function safeLimit(maximumLength, fallback) {
     return Math.max(1, Math.min(maximumDiagnosticLength, Math.floor(limit)))
 }
 
-function boundedInspectionText(value, inspectionLimit) {
+function boundedInspectionText(value, inspectionLimit, lookaheadLength) {
     var text = typeof value === "string" ? value : String(value || "")
     var windowLength = safeLimit(inspectionLimit, maximumCliMessageLength)
+    var lookahead = Math.max(0, Math.min(credentialRedactionLookaheadLength, Number(lookaheadLength) || 0))
     var scanLimit = Math.min(text.length, maximumDiagnosticLength)
     var chunkLength = Math.max(256, windowLength)
     for (var offset = 0; offset < scanLimit; offset += chunkLength) {
@@ -22,7 +24,7 @@ function boundedInspectionText(value, inspectionLimit) {
         var firstVisible = chunk.search(/[^\s\u0000-\u001f\u007f]/)
         if (firstVisible !== -1) {
             var start = offset + firstVisible
-            return text.slice(start, start + windowLength)
+            return text.slice(start, start + windowLength + lookahead)
         }
     }
     return ""
@@ -30,7 +32,10 @@ function boundedInspectionText(value, inspectionLimit) {
 
 function redactCredentials(value, inspectionLimit) {
     var limit = safeLimit(inspectionLimit, maximumCliMessageLength)
-    var text = boundedInspectionText(value, Math.min(maximumDiagnosticLength, limit * 8))
+    var text = boundedInspectionText(
+        value,
+        Math.min(maximumDiagnosticLength, limit * 8),
+        credentialRedactionLookaheadLength)
     return text
         .replace(/((?:proxy-)?authorization["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\r\n]*)/gi, "$1[redacted]")
         .replace(/\bbearer\s+(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, "Bearer [redacted]")
@@ -47,6 +52,36 @@ function boundedDisplayText(value, maximumLength) {
         .replace(/\s+/g, " ")
         .trim()
     return text.length > limit ? text.slice(0, limit) : text
+}
+
+// Dynamic-loader warnings reach stderr before the CLI produces any output, so
+// they lead the bounded stderr excerpt shown as a failure reason. The common
+// case is glibc's "no version information available", emitted when the upstream
+// glibc build (linked against Debian's versioned libcurl) runs on a distro that
+// ships libcurl without symbol versioning. They are non-fatal and say nothing
+// about why a command failed, so drop them and let the real message surface.
+var loaderDiagnosticMarker = "no version information available"
+var loaderDiagnosticPattern = /^.*:\s*no version information available\s*\(required by .*\)$/
+
+function stripLoaderDiagnostics(value, maximumLength) {
+    var limit = safeLimit(maximumLength, maximumCliMessageLength)
+    var text = boundedInspectionText(value, Math.min(maximumDiagnosticLength, limit * 8))
+    if (text.indexOf(loaderDiagnosticMarker) === -1) {
+        return text
+    }
+
+    var lines = text.split("\n")
+    var kept = []
+    for (var index = 0; index < lines.length; index++) {
+        if (!loaderDiagnosticPattern.test(lines[index].replace(/\r$/, "").trim())) {
+            kept.push(lines[index])
+        }
+    }
+
+    // Keep the original text when loader noise was all stderr carried, so a
+    // failure never surfaces as an empty message.
+    var stripped = kept.join("\n")
+    return stripped.trim().length > 0 ? stripped : text
 }
 
 function cliJsonText(value) {
